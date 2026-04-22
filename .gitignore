@@ -1,5 +1,8 @@
+Cargo.lock
 /target
 /recalign
 *.txt
 *.log
 *.out
+/scripts
+/test_data

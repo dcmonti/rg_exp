@@ -3,7 +3,18 @@ use std::{collections::HashMap, str};
 
 pub fn index_paths(gfa_file: &str) -> PathIndex {
     let parser = gfa::parser::GFAParser::new();
-    let gfa: GFA<Vec<u8>, ()> = parser.parse_file(gfa_file).unwrap();
+    let gfa: GFA<Vec<u8>, ()> = if gfa_file.ends_with(".gz") {
+        use flate2::read::MultiGzDecoder;
+        use std::{fs::File, io::Read};
+        let f = File::open(gfa_file).expect("Cannot open GFA file");
+        let mut buf = Vec::new();
+        MultiGzDecoder::new(f)
+            .read_to_end(&mut buf)
+            .expect("Failed to decompress GFA");
+        parser.parse_lines(buf.split(|&b| b == b'\n')).unwrap()
+    } else {
+        parser.parse_file(gfa_file).unwrap()
+    };
     let mut index = PathIndex::new();
     for segment in &gfa.segments {
         index.add_node(segment.name.clone(), segment.sequence.clone());

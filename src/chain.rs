@@ -33,97 +33,106 @@ pub fn extract_subgraph(
 ) -> GFA<Vec<u8>, ()> {
     let from_node = &from_anchor.graph_pos.node_id;
     let to_node = &to_anchor.graph_pos.node_id;
-    // paths to keep are those either in from or to node
+    // reversed = anchors map to the reverse strand; from_node comes AFTER to_node in path order
+    let reversed = !from_anchor.graph_pos.orientation;
     let paths_to_keep = path_index.both_paths(from_node, to_node);
-    // keep only segments and links that are part of the paths in path_names_to_keep between from_node and to_node
     let mut subgraph: GFA<Vec<u8>, ()> = GFA::new();
     let mut segments_set = std::collections::HashSet::new();
-    // Further implementation needed to build the subgraph
+
     for (path_id, relation) in paths_to_keep {
         let path_name = &path_index.paths_to_ids[&path_id];
-        
-        // compute start and end indices in the path, 
-        // if in Both relation, use from_node and to_node positions
-        // if in First relation, use from_node position to first node at length substr_len
-        // if in Second relation, use to_node position back to first node at length substr_len
+        let path_nodes_list = &path_index.paths[&path_id].nodes;
+
+        // Compute (st_idx, en_idx) as a sorted [lo, hi] range to slice path_nodes_list.
+        // `reversed` controls iteration order and orientation flipping later.
         let (st_idx, en_idx) = match relation {
             graph_index::PathRelation::Both => {
-                let st = path_index
-                    .get(&from_node)
-                    .unwrap()
-                    .get_path_fl(&path_id)
-                    .unwrap()
-                    .0;
-                let en = path_index
-                    .get(&to_node)
-                    .unwrap()
-                    .get_path_fl(&path_id)
-                    .unwrap()
-                    .1;
-                (st, en)
+                let from_idx = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
+                let to_idx   = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().1;
+                // For reversed reads from_node is after to_node in path order, so from_idx > to_idx.
+                // Normalise to lo..=hi; iteration direction is decided below.
+                if from_idx <= to_idx { (from_idx, to_idx) } else { (to_idx, from_idx) }
             },
             graph_index::PathRelation::First => {
-                let st = path_index
-                    .get(&from_node)
-                    .unwrap()
-                    .get_path_fl(&path_id)
-                    .unwrap()
-                    .0;
-                let mut en = st;
-                let mut curr_len = 0;
-                while curr_len < substr_len && en < path_index.paths[&path_id].nodes.len() {
-                    let next_node = &path_index.paths[&path_id].nodes[en].0;
-                    let next_node_len = path_index.get(&next_node).unwrap().segment.len();
-                    curr_len += next_node_len;
-                    en += 1;
+                // Only from_node is in this path.
+                let anchor_idx = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
+                if reversed {
+                    // Reversed: walk backward (toward lower indices) from from_node.
+                    let mut st = anchor_idx;
+                    let mut curr_len = 0;
+                    while curr_len < substr_len && st > 0 {
+                        curr_len += path_index.get(&path_nodes_list[st].0).unwrap().segment.len();
+                        st -= 1;
+                    }
+                    (st, anchor_idx)
+                } else {
+                    // Forward: walk forward (toward higher indices) from from_node.
+                    let mut en = anchor_idx;
+                    let mut curr_len = 0;
+                    while curr_len < substr_len && en < path_nodes_list.len() {
+                        curr_len += path_index.get(&path_nodes_list[en].0).unwrap().segment.len();
+                        en += 1;
+                    }
+                    (anchor_idx, en)
                 }
-                (st, en)
             },
             graph_index::PathRelation::Second => {
-                let en = path_index
-                    .get(&to_node)
-                    .unwrap()
-                    .get_path_fl(&path_id)
-                    .unwrap()
-                    .1;
-                let mut st = en;
-                let mut curr_len = 0;
-                while curr_len < substr_len && st > 0 {
-                    let prev_node = &path_index.paths[&path_id].nodes[st].0;
-                    let prev_node_len = path_index.get(&prev_node).unwrap().segment.len();
-                    curr_len += prev_node_len;
-                    if st == 0 {
-                        break;
+                // Only to_node is in this path.
+                let anchor_idx = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().1;
+                if reversed {
+                    // Reversed: walk forward (toward higher indices) from to_node.
+                    let mut en = anchor_idx;
+                    let mut curr_len = 0;
+                    while curr_len < substr_len && en < path_nodes_list.len() {
+                        curr_len += path_index.get(&path_nodes_list[en].0).unwrap().segment.len();
+                        en += 1;
                     }
-                    st -= 1;
+                    (anchor_idx, en)
+                } else {
+                    // Forward: walk backward (toward lower indices) to to_node.
+                    let mut st = anchor_idx;
+                    let mut curr_len = 0;
+                    while curr_len < substr_len && st > 0 {
+                        curr_len += path_index.get(&path_nodes_list[st].0).unwrap().segment.len();
+                        st -= 1;
+                    }
+                    (st, anchor_idx)
                 }
-                (st, en)
             },
         };
 
-        // Add segments between from_node and to_node in this path
+        let st_idx = st_idx.min(path_nodes_list.len().saturating_sub(1));
+        let en_idx = en_idx.min(path_nodes_list.len().saturating_sub(1));
+        let (st_idx, en_idx) = if st_idx <= en_idx { (st_idx, en_idx) } else { (en_idx, st_idx) };
+
         let mut path_nodes = Vec::new();
-        let nodes = &path_index.paths[&path_id].nodes;
-        // ensure indices are within bounds
-        let mut st_idx = std::cmp::min(st_idx, nodes.len().saturating_sub(1));
-        let mut en_idx = std::cmp::min(en_idx, nodes.len().saturating_sub(1));
-        if st_idx > en_idx {
-           let tmp = st_idx;
-           st_idx = en_idx;
-           en_idx = tmp;
-        }
-        nodes[st_idx..=en_idx].iter().for_each(|(node_id, orientation)| {
-            let mut seq_slice: &[u8] = path_index.get(&node_id).unwrap().segment.as_slice();
-            // if first node, trim to from position start
+
+        // Always iterate in path order. For reversed reads, from_node sits at the high
+        // end and to_node at the low end of the range; the RC'd read (sent to recalign)
+        // aligns left-to-right against the forward-orientation path segments.
+        for (node_id, path_orientation) in &path_nodes_list[st_idx..=en_idx] {
+            let mut seq_slice: &[u8] = path_index.get(node_id).unwrap().segment.as_slice();
+
             if node_id == from_node {
-                let from_pos = from_anchor.graph_pos.position.0;
-                seq_slice = &seq_slice[from_pos..];
+                if reversed {
+                    // from_node is the LAST segment for the RC'd read; trim like a to_node
+                    // in the forward case: keep [..s_end] so the gap toward the next anchor
+                    // is included.
+                    seq_slice = &seq_slice[..from_anchor.graph_pos.position.1];
+                } else {
+                    seq_slice = &seq_slice[from_anchor.graph_pos.position.0..];
+                }
             }
-            // if last node, trim to to position end
             if node_id == to_node {
-                let to_pos = to_anchor.graph_pos.position.1;
-                seq_slice = &seq_slice[..to_pos];
+                if reversed {
+                    // to_node is the FIRST segment for the RC'd read; trim like a from_node
+                    // in the forward case: keep [s_start..] so the gap is included.
+                    seq_slice = &seq_slice[to_anchor.graph_pos.position.0..];
+                } else {
+                    seq_slice = &seq_slice[..to_anchor.graph_pos.position.1];
+                }
             }
+
             let id_slice: &[u8] = node_id.as_slice();
             let seg = gfa::gfa::Segment {
                 name: id_slice.to_vec(),
@@ -134,18 +143,14 @@ pub fn extract_subgraph(
                 segments_set.insert(id_slice.to_vec());
                 subgraph.segments.push(seg);
             }
-            let direction = if *orientation {
-                [b'+', b',']
-            } else {
-                [b'-', b',']
-            };
+
+            let direction = if *path_orientation { [b'+', b','] } else { [b'-', b','] };
             let mut new_node = node_id.to_vec();
             new_node.extend_from_slice(&direction);
             path_nodes.extend_from_slice(&new_node);
+        }
 
-        }); 
         path_nodes.pop(); // remove trailing comma
-        //add \t* at the end
         path_nodes.extend_from_slice(b"\t*");
         let new_path: gfa::gfa::Path<Vec<u8>, _> = gfa::gfa::Path::new(
             path_name.clone(),

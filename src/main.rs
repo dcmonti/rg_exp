@@ -3,37 +3,50 @@ use rg_exp::{
     chain::{self, Chain},
     graph_index, parser, reads,
 };
-use std::{collections::HashMap, hash::Hash, path, process::Command};
+use std::{collections::HashMap, process::Command};
 fn main() {
     let args = parser::Args::parse();
     let graph_path = args.graph;
     let reads_path = args.reads;
 
-    let mut build_chain = Command::new("minigraph");
-    build_chain
-        .arg("-xlr")
-        .arg("-c")
-        .arg("-S")
-        .arg("-t1")
-        .arg(&graph_path)
-        .arg(&reads_path);
-    let output = build_chain.output();
+    let chain_bytes: Vec<u8> = if let Some(chain_path) = args.chain {
+        eprintln!("Reading chain from file: {}", chain_path);
+        std::fs::read(&chain_path).unwrap_or_else(|e| {
+            eprintln!("Failed to read chain file: {}", e);
+            std::process::exit(1);
+        })
+    } else {
+        let output = Command::new("minigraph")
+            .arg("-xlr")
+            .arg("-c")
+            .arg("-S")
+            .arg("-t1")
+            .arg(&graph_path)
+            .arg(&reads_path)
+            .output();
+        match output {
+            Ok(o) => {
+                eprintln!("Minigraph command executed with status: {}", o.status);
+                std::fs::write("minigraph_output.txt", &o.stdout)
+                    .expect("Unable to write minigraph output to file");
+                o.stdout
+            }
+            Err(e) => {
+                eprintln!("Failed to execute minigraph: {}", e);
+                std::process::exit(1);
+            }
+        }
+    };
 
-    if let Ok(output) = &output {
-        eprintln!("Minigraph command executed with status: {}", output.status);
-        // build path index
+    // build path index
         let index = graph_index::index_paths(&graph_path);
         // load the reads
         let reads = reads::parse_reads(&reads_path);
         // split the output per read
-        let split_alignments = split_reads_alignment(output.stdout.as_ref());
+        let split_alignments = split_reads_alignment(&chain_bytes);
 
         // gafs
         let mut gafs: HashMap<String, rg_exp::gaf::GAFStruct> = HashMap::new();
-        // save output to tmp file for debugging
-        let tmp_output_path = path::Path::new("minigraph_output.txt");
-        std::fs::write(tmp_output_path, &output.stdout)
-            .expect("Unable to write minigraph output to file");
 
         // iterate over each read anchor
         for (read_id_b, chain_b) in split_alignments.iter() {
@@ -144,7 +157,6 @@ fn main() {
         for (read_id, gaf) in gafs.iter() {
             println!("GAF for read {}:\n{}", read_id, gaf.clone().to_string());
         }
-    }
 }
 
 fn split_reads_alignment(output: &[u8]) -> Vec<(Vec<u8>, Chain)> {

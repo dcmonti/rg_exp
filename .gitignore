@@ -1,0 +1,5 @@
+/target
+/recalign
+*.txt
+*.log
+*.out

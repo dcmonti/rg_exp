@@ -35,7 +35,7 @@ pub fn extract_subgraph(
     let to_node = &to_anchor.graph_pos.node_id;
     // reversed = anchors map to the reverse strand; from_node comes AFTER to_node in path order
     let reversed = !from_anchor.graph_pos.orientation;
-    let paths_to_keep = path_index.both_paths(from_node, to_node);
+    let paths_to_keep = path_index.common_paths(from_node, to_node);
     let mut subgraph: GFA<Vec<u8>, ()> = GFA::new();
     let mut segments_set = std::collections::HashSet::new();
 

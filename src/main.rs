@@ -54,7 +54,11 @@ fn main() {
             if chain_b.anchors.len() < 2 {
                 continue;
             }
-
+            eprintln!(
+                "Processing read {} with {} anchors",
+                String::from_utf8_lossy(&read_id_b),
+                chain_b.anchors.len()
+            );
             for window in chain_b.anchors.windows(2) {
                 let from = &window[0];
                 let to = &window[1];
@@ -99,10 +103,14 @@ fn main() {
                     String::from_utf8_lossy(&read_id_b),
                     read_slice
                 );
+                // DEBUG
+                eprintln!("Subgraph GFA:\n{}", gfa_out);
+                eprintln!("Read slice:\n{}", read_out);
 
                 // do alignment with recalign
-                let run_recalign = Command::new("./recalign/target/release/recalign")
+                let run_recalign = Command::new("../recalign/target/release/recalign")
                     .arg("-efast")
+                    .arg("-s8")
                     .arg("-m")
                     .arg("-k2")
                     .arg("-r1")
@@ -131,8 +139,21 @@ fn main() {
                 match run_recalign {
                     Ok(recalign_output) => {
                         eprintln!("Recalign executed with status: {}", recalign_output.status);
+                        if !recalign_output.status.success() {
+                            eprintln!(
+                                "Recalign failed for anchor pair ({} -> {}), skipping.",
+                                String::from_utf8_lossy(&from.graph_pos.node_id),
+                                String::from_utf8_lossy(&to.graph_pos.node_id)
+                            );
+                            continue;
+                        }
 
                         let mut gaf = get_gaf_from_recalign_output(&recalign_output.stdout, rc);
+                        // fix: use actual read length, not the slice length recalign saw
+                        gaf.query_length = reads
+                            .get(&String::from_utf8_lossy(&read_id_b).to_string())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
                         // update read_start and read_end to be relative to the whole read
                         gaf.query_start += from.read_start;
                         gaf.query_end += from.read_start;

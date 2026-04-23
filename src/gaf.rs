@@ -147,7 +147,7 @@ impl GAFStruct {
 
         GAFStruct::build_gaf_struct(
             gaf1.query_name.clone(),
-            gaf1.query_length + gaf2_adj.query_length,
+            gaf1.query_length, // query_length is the read length, invariant across merges
             new_query_start,
             new_query_end,
             gaf1.strand,

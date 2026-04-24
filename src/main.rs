@@ -6,6 +6,9 @@ use rg_exp::{
 };
 use std::collections::HashMap;
 use std::process::Command;
+
+const RECALIGN_BIN: &str = "recalign/target/release/recalign";
+
 fn main() {
     let args = parser::Args::parse();
     let graph_path = args.graph;
@@ -141,7 +144,7 @@ fn process_chain_alignment(
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
 
         // do alignment with recalign
-        let run_recalign = Command::new("../recalign/target/release/recalign")
+        let run_recalign = Command::new(RECALIGN_BIN)
             .arg("-efast")
             .arg("-s8")
             .arg("-m")
@@ -201,7 +204,11 @@ fn process_chain_alignment(
                 });
             }
             Err(e) => {
-                eprintln!("Failed to execute recalign: {}", e);
+                eprintln!(
+                    "Failed to execute recalign at '{}': {}. Build the submodule first (e.g. `cd recalign && cargo build --release`).",
+                    RECALIGN_BIN,
+                    e
+                );
             }
         }
     }

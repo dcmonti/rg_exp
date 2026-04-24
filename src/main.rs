@@ -3,7 +3,7 @@ use rg_exp::{
     chain::{self, Chain},
     graph_index, parser, reads,
 };
-use std::{collections::HashMap, process::Command};
+use std::process::Command;
 fn main() {
     let args = parser::Args::parse();
     let graph_path = args.graph;
@@ -47,20 +47,24 @@ fn main() {
         // split the output per read
         let split_alignments = split_reads_alignment(&chain_bytes);
 
-        // gafs
-        let mut gafs: HashMap<String, rg_exp::gaf::GAFStruct> = HashMap::new();
+        // One GAF record per minigraph chain (so secondary mappings stay separated,
+        // like minigraph's own split output). A Vec preserves insertion order.
+        let mut gafs: Vec<(String, rg_exp::gaf::GAFStruct)> = Vec::new();
 
         // iterate over each read anchor
         for (read_id_b, chain_b) in split_alignments.iter() {
             // iterate over anchors, 1-2, 2-3, ...
             if chain_b.anchors.len() < 2 {
+                // Single-anchor chunks: minigraph hit only one node, no fill gap exists
+                // and rg_exp cannot add anything beyond what minigraph already reports.
                 continue;
             }
+            let read_id_str = String::from_utf8_lossy(&read_id_b).to_string();
             eprintln!(
                 "Processing read {} with {} anchors",
-                String::from_utf8_lossy(&read_id_b),
-                chain_b.anchors.len()
+                read_id_str, chain_b.anchors.len()
             );
+            let mut chain_gaf: Option<rg_exp::gaf::GAFStruct> = None;
             for window in chain_b.anchors.windows(2) {
                 let from = &window[0];
                 let to = &window[1];
@@ -163,15 +167,11 @@ fn main() {
                         // project local subgraph path coordinates to global path coordinates
                         normalize_gaf_global_path_coords(&mut gaf, from, &index);
 
-                        // if first time, insert, else, merge
-                        let read_id_str = String::from_utf8_lossy(&read_id_b).to_string();
-                        if let Some(existing_gaf) = gafs.get_mut(&read_id_str) {
-                            let merged_gaf =
-                                rg_exp::gaf::GAFStruct::merge_gafs(existing_gaf, &gaf);
-                            *existing_gaf = merged_gaf;
-                        } else {
-                            gafs.insert(read_id_str, gaf);
-                        }
+                        // Accumulate per-chain only; do not merge across chains.
+                        chain_gaf = Some(match chain_gaf.take() {
+                            Some(existing) => rg_exp::gaf::GAFStruct::merge_gafs(&existing, &gaf),
+                            None => gaf,
+                        });
                     }
                     Err(e) => {
                         eprintln!("Failed to execute recalign: {}", e);
@@ -179,16 +179,16 @@ fn main() {
                 }
             }
 
-            let read_id_str = String::from_utf8_lossy(read_id_b).to_string();
-            if let Some(gaf) = gafs.get_mut(&read_id_str) {
-                finalize_gaf_global_coords_from_chain(gaf, chain_b, &index);
+            if let Some(mut gaf) = chain_gaf {
+                finalize_gaf_global_coords_from_chain(&mut gaf, chain_b, &index);
                 gaf.reconcile_cigar_with_spans();
                 // Match minigraph convention: strand on primary record is '+' and
                 // path orientation is represented in the path string itself.
                 gaf.strand = '+';
+                gafs.push((read_id_str, gaf));
             }
         }
-        // print gafs
+        // print gafs (one line per chain; multi-mapping reads yield multiple lines)
         for (_read_id, gaf) in gafs.iter() {
             println!("{}", gaf.clone().to_string());
         }

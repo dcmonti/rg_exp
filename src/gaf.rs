@@ -66,22 +66,45 @@ impl GAFStruct {
 
     pub fn reverse_complement(&self) -> GAFStruct {
         let new_strand = if self.strand == '+' { '-' } else { '+' };
-        // flip path 
         let new_path: Vec<usize> = self.path.iter().rev().cloned().collect();
+
+        // reverse the comment tags safely, specifically cg:Z:
+        let mut new_comments_vec = Vec::new();
+        for tag in self.comments.split('\t') {
+            if tag.starts_with("cg:Z:") {
+                let cigar = &tag[5..];
+                // parse cigar and reverse
+                // e.g. 10M1I5D -> 5D1I10M
+                let mut ops = Vec::new();
+                let mut num_start = 0;
+                for (i, c) in cigar.char_indices() {
+                    if c.is_alphabetic() || c == '=' {
+                        ops.push(&cigar[num_start..=i]);
+                        num_start = i + 1;
+                    }
+                }
+                ops.reverse();
+                new_comments_vec.push(format!("cg:Z:{}", ops.join("")));
+            } else {
+                new_comments_vec.push(tag.to_string());
+            }
+        }
+        let new_comments = new_comments_vec.join("	");
+
         GAFStruct {
             query_name: self.query_name.clone(),
             query_length: self.query_length,
-            query_start: self.query_start,
-            query_end: self.query_end,
+            query_start: self.query_length - self.query_end,
+            query_end: self.query_length - self.query_start,
             strand: new_strand,
             path: new_path,
             path_length: self.path_length,
-            path_start: self.path_start,
-            path_end: self.path_end,
+            path_start: self.path_length - self.path_end,
+            path_end: self.path_length - self.path_start,
             residue_matches_number: self.residue_matches_number,
             alignment_block_length: self.alignment_block_length.clone(),
             mapping_quality: self.mapping_quality.clone(),
-            comments: self.comments.clone(),
+            comments: new_comments,
         }
     }
     pub fn merge_gafs(gaf1: &GAFStruct, gaf2: &GAFStruct) -> GAFStruct {

@@ -21,6 +21,7 @@ fn main() {
             .arg("--vc")
             .arg("-c")
             .arg("-S")
+            .arg("-N0")
             .arg("-t1")
             .arg(&graph_path)
             .arg(&reads_path)
@@ -176,8 +177,8 @@ fn main() {
             }
         }
         // print gafs
-        for (read_id, gaf) in gafs.iter() {
-            println!("GAF for read {}:\n{}", read_id, gaf.clone().to_string());
+        for (_read_id, gaf) in gafs.iter() {
+            println!("{}", gaf.clone().to_string());
         }
 }
 

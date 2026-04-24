@@ -18,6 +18,7 @@ fn main() {
     } else {
         let output = Command::new("minigraph")
             .arg("-xlr")
+            .arg("--vc")
             .arg("-c")
             .arg("-S")
             .arg("-t1")

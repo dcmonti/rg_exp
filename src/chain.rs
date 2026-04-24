@@ -12,11 +12,19 @@ pub fn build_chain(alignment: &str) -> Chain {
         let fields = line.split('\t').collect::<Vec<&str>>();
         if fields.len() == 9 {
             let s_name = &fields[1][1..];
-            let s_start: usize = fields[5].parse().unwrap();
-            let s_end: usize = fields[6].parse().unwrap();
+            let s_len: usize = fields[2].parse().unwrap();
+            let mut s_start: usize = fields[5].parse().unwrap();
+            let mut s_end: usize = fields[6].parse().unwrap();
             let q_start: usize = fields[7].parse().unwrap();
             let q_end: usize = fields[8].parse().unwrap();
             let orientation = fields[1].chars().next().unwrap() == '>';
+
+            if !orientation {
+                let tmp = s_start;
+                s_start = s_len - s_end;
+                s_end = s_len - tmp;
+            }
+
             let graph_pos = Pos::new(s_name.as_bytes().to_vec(), (s_start, s_end), orientation);
             let anchor = Anchor::new(graph_pos, q_start, q_end);
             chain.add_anchor(anchor);

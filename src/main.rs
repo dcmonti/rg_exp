@@ -160,6 +160,9 @@ fn main() {
                         gaf.query_start += from.read_start;
                         gaf.query_end += from.read_start;
 
+                        // project local subgraph path coordinates to global path coordinates
+                        normalize_gaf_global_path_coords(&mut gaf, from, &index);
+
                         // if first time, insert, else, merge
                         let read_id_str = String::from_utf8_lossy(&read_id_b).to_string();
                         if let Some(existing_gaf) = gafs.get_mut(&read_id_str) {
@@ -175,11 +178,125 @@ fn main() {
                     }
                 }
             }
+
+            let read_id_str = String::from_utf8_lossy(read_id_b).to_string();
+            if let Some(gaf) = gafs.get_mut(&read_id_str) {
+                finalize_gaf_global_coords_from_chain(gaf, chain_b, &index);
+                gaf.reconcile_cigar_with_spans();
+                // Match minigraph convention: strand on primary record is '+' and
+                // path orientation is represented in the path string itself.
+                gaf.strand = '+';
+            }
         }
         // print gafs
         for (_read_id, gaf) in gafs.iter() {
             println!("{}", gaf.clone().to_string());
         }
+}
+
+fn path_total_len(index: &graph_index::PathIndex, node_path: &[usize]) -> usize {
+    node_path
+        .iter()
+        .filter_map(|id| index.get(id.to_string().as_bytes()))
+        .map(|ni| ni.segment.len())
+        .sum()
+}
+
+fn normalize_gaf_global_path_coords(
+    gaf: &mut rg_exp::gaf::GAFStruct,
+    from: &rg_exp::chain::Anchor,
+    index: &graph_index::PathIndex,
+) {
+    let total_len = path_total_len(index, &gaf.path);
+    if total_len == 0 {
+        return;
+    }
+
+    let anchor_node_len = index
+        .get(&from.graph_pos.node_id)
+        .map(|ni| ni.segment.len())
+        .unwrap_or(0);
+
+    // Use anchor offset as origin for this window in the oriented path coordinate space.
+    let base_offset = if gaf.strand == '+' {
+        from.graph_pos.position.0
+    } else {
+        anchor_node_len.saturating_sub(from.graph_pos.position.1)
+    };
+
+    gaf.path_length = total_len;
+    gaf.path_start = base_offset.saturating_add(gaf.path_start).min(total_len);
+    gaf.path_end = base_offset.saturating_add(gaf.path_end).min(total_len);
+}
+
+fn coord_on_gaf_path(
+    gaf: &rg_exp::gaf::GAFStruct,
+    anchor: &rg_exp::chain::Anchor,
+    use_start: bool,
+    index: &graph_index::PathIndex,
+) -> Option<usize> {
+    let anchor_id = std::str::from_utf8(&anchor.graph_pos.node_id)
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+
+    let mut prefix = 0usize;
+    for node in &gaf.path {
+        let node_len = index
+            .get(node.to_string().as_bytes())
+            .map(|ni| ni.segment.len())
+            .unwrap_or(0);
+        if *node == anchor_id {
+            let local = if gaf.strand == '+' {
+                if use_start {
+                    anchor.graph_pos.position.0
+                } else {
+                    anchor.graph_pos.position.1
+                }
+            } else if use_start {
+                node_len.saturating_sub(anchor.graph_pos.position.1)
+            } else {
+                node_len.saturating_sub(anchor.graph_pos.position.0)
+            };
+            return Some(prefix.saturating_add(local));
+        }
+        prefix = prefix.saturating_add(node_len);
+    }
+    None
+}
+
+fn finalize_gaf_global_coords_from_chain(
+    gaf: &mut rg_exp::gaf::GAFStruct,
+    chain: &rg_exp::chain::Chain,
+    index: &graph_index::PathIndex,
+) {
+    let total_len = path_total_len(index, &gaf.path);
+    if total_len == 0 || chain.anchors.is_empty() {
+        return;
+    }
+
+    gaf.path_length = total_len;
+
+    let first = match chain.anchors.first() {
+        Some(a) => a,
+        None => return,
+    };
+    let last = match chain.anchors.last() {
+        Some(a) => a,
+        None => return,
+    };
+
+    if let Some(ps) = coord_on_gaf_path(gaf, first, true, index) {
+        gaf.path_start = ps.min(total_len);
+    }
+
+    if let Some(pe) = coord_on_gaf_path(gaf, last, false, index) {
+        gaf.path_end = pe.min(total_len);
+    }
+
+    if gaf.path_start > gaf.path_end {
+        std::mem::swap(&mut gaf.path_start, &mut gaf.path_end);
+    }
 }
 
 fn split_reads_alignment(output: &[u8]) -> Vec<(Vec<u8>, Chain)> {

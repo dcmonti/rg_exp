@@ -1,0 +1,3 @@
+[submodule "recalign"]
+	path = recalign
+	url = https://github.com/AlgoLab/RecGraph

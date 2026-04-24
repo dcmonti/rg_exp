@@ -27,4 +27,13 @@ pub struct Args {
         help = "Minigraph chain output file; if provided, minigraph is not invoked",
     )]
     pub chain: Option<String>,
+
+    /// Maximum number of reads/chains processed in parallel
+    #[clap(
+        short = 't',
+        long = "threasd",
+        help = "Number of threads",
+        default_value_t = 1,
+    )]
+    pub max_reads: usize,
 }

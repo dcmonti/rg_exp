@@ -5,9 +5,12 @@ use rg_exp::{
     graph_index, parser, reads,
 };
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
+const ALIGNMENT_CHUNK_SIZE: usize = 100;
 
 fn main() {
     let args = parser::Args::parse();
@@ -15,14 +18,26 @@ fn main() {
     let reads_path = args.reads;
     let max_reads = args.max_reads.max(1);
 
-    let chain_bytes: Vec<u8> = if let Some(chain_path) = args.chain {
+    // build path index
+    let index = graph_index::index_paths(&graph_path);
+    // load the reads
+    let reads = reads::parse_reads(&reads_path);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_reads)
+        .build()
+        .expect("Failed to build rayon thread pool");
+
+    if let Some(chain_path) = args.chain {
         eprintln!("Reading chain from file: {}", chain_path);
-        std::fs::read(&chain_path).unwrap_or_else(|e| {
-            eprintln!("Failed to read chain file: {}", e);
+        let file = File::open(&chain_path).unwrap_or_else(|e| {
+            eprintln!("Failed to open chain file {}: {}", chain_path, e);
             std::process::exit(1);
-        })
+        });
+        let reader = BufReader::new(file);
+        process_chain_stream(reader, &reads, &index, &pool, None);
     } else {
-        let output = Command::new("minigraph")
+        let mut child = Command::new("minigraph")
             .arg("-xlr")
             .arg("--vc")
             .arg("-c")
@@ -31,50 +46,128 @@ fn main() {
             .arg("-t1")
             .arg(&graph_path)
             .arg(&reads_path)
-            .output();
-        match output {
-            Ok(o) => {
-                eprintln!("Minigraph command executed with status: {}", o.status);
-                std::fs::write("minigraph_output.txt", &o.stdout)
-                    .expect("Unable to write minigraph output to file");
-                o.stdout
-            }
-            Err(e) => {
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
                 eprintln!("Failed to execute minigraph: {}", e);
+                std::process::exit(1);
+            });
+
+        let stdout = child.stdout.take().unwrap_or_else(|| {
+            eprintln!("Failed to capture minigraph stdout");
+            std::process::exit(1);
+        });
+        let reader = BufReader::new(stdout);
+        let mut out_file = File::create("minigraph_output.txt").unwrap_or_else(|e| {
+            eprintln!("Unable to create minigraph_output.txt: {}", e);
+            std::process::exit(1);
+        });
+
+        process_chain_stream(reader, &reads, &index, &pool, Some(&mut out_file));
+
+        let status = child.wait().unwrap_or_else(|e| {
+            eprintln!("Failed waiting for minigraph: {}", e);
+            std::process::exit(1);
+        });
+        eprintln!("Minigraph command executed with status: {}", status);
+    }
+}
+
+fn process_chain_stream<R: BufRead>(
+    reader: R,
+    reads: &HashMap<String, String>,
+    index: &graph_index::PathIndex,
+    pool: &rayon::ThreadPool,
+    mut mirror_out: Option<&mut File>,
+) {
+    let mut pending: Vec<(Vec<u8>, Chain, String)> = Vec::with_capacity(ALIGNMENT_CHUNK_SIZE);
+    let mut current_read_alignment = String::new();
+    let mut current_primary_line = String::new();
+    let mut read_id: Vec<u8> = Vec::new();
+    let mut chunk_no: usize = 0;
+
+    for line_res in reader.lines() {
+        let line = line_res.unwrap_or_else(|e| {
+            eprintln!("Failed to read alignment line: {}", e);
+            std::process::exit(1);
+        });
+
+        if let Some(f) = mirror_out.as_mut() {
+            if let Err(e) = writeln!(*f, "{}", line) {
+                eprintln!("Failed writing minigraph output mirror: {}", e);
                 std::process::exit(1);
             }
         }
-    };
 
-    // build path index
-        let index = graph_index::index_paths(&graph_path);
-        // load the reads
-        let reads = reads::parse_reads(&reads_path);
-        // split the output per read
-        let split_alignments = split_reads_alignment(&chain_bytes);
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(max_reads)
-            .build()
-            .expect("Failed to build rayon thread pool");
-
-        let mut gafs = pool.install(|| {
-            split_alignments
-                .par_iter()
-                .enumerate()
-                .filter_map(|(i, (read_id_b, chain_b, primary_line))| {
-                    process_chain_alignment(i, read_id_b, chain_b, primary_line, &reads, &index)
-                })
-                .collect::<Vec<_>>()
-        });
-
-        // Preserve deterministic output ordering by original chain position.
-        gafs.sort_by_key(|(i, _, _)| *i);
-
-        // print gafs (one line per chain; multi-mapping reads yield multiple lines)
-        for (_, _read_id, gaf) in gafs.iter() {
-            println!("{}", gaf.clone().to_string());
+        if line.is_empty() {
+            continue;
         }
+        if line.as_bytes()[0] == b'*' {
+            current_read_alignment.push_str(&line);
+            current_read_alignment.push('\n');
+        } else {
+            if !current_read_alignment.is_empty() {
+                let chain = chain::build_chain(&current_read_alignment);
+                pending.push((read_id.clone(), chain, current_primary_line.clone()));
+                current_read_alignment.clear();
+            }
+            read_id = line
+                .split('\t')
+                .next()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            current_primary_line = line;
+        }
+
+        if pending.len() >= ALIGNMENT_CHUNK_SIZE {
+            chunk_no += 1;
+            process_one_chunk(&pending, reads, index, pool, chunk_no);
+            pending.clear();
+        }
+    }
+
+    if !current_read_alignment.is_empty() {
+        let chain = chain::build_chain(&current_read_alignment);
+        pending.push((read_id.clone(), chain, current_primary_line.clone()));
+    }
+
+    if !pending.is_empty() {
+        chunk_no += 1;
+        process_one_chunk(&pending, reads, index, pool, chunk_no);
+    }
+}
+
+fn process_one_chunk(
+    chunk: &[(Vec<u8>, Chain, String)],
+    reads: &HashMap<String, String>,
+    index: &graph_index::PathIndex,
+    pool: &rayon::ThreadPool,
+    chunk_no: usize,
+) {
+    let mut gafs = pool.install(|| {
+        chunk
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, (read_id_b, chain_b, primary_line))| {
+                process_chain_alignment(i, read_id_b, chain_b, primary_line, reads, index)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // Preserve deterministic output ordering inside each chunk.
+    gafs.sort_by_key(|(i, _, _)| *i);
+
+    // print gafs (one line per chain; multi-mapping reads yield multiple lines)
+    for (_, _read_id, gaf) in gafs.iter() {
+        println!("{}", gaf.clone().to_string());
+    }
+
+    // Force progressive writes even when stdout is redirected to file/pipe.
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("Warning: failed to flush stdout after chunk {}: {}", chunk_no, e);
+    }
+    eprintln!("Chunk {} flushed ({} chains).", chunk_no, chunk.len());
 }
 
 fn process_chain_alignment(
@@ -102,10 +195,8 @@ fn process_chain_alignment(
     }
 
     let read_id_str = String::from_utf8_lossy(read_id_b).to_string();
-    eprintln!(
-        "Processing read {} with {} anchors",
-        read_id_str, chain_b.anchors.len()
-    );
+    let read_seq_opt = reads.get(&read_id_str);
+    // Keep logs concise on large datasets.
     let mut chain_gaf: Option<rg_exp::gaf::GAFStruct> = None;
     for window in chain_b.anchors.windows(2) {
         let from = &window[0];
@@ -113,7 +204,7 @@ fn process_chain_alignment(
         let mut rc = false;
         // get read sequence slice delimited by from and to
         let mut read_slice: String;
-        if let Some(read_seq) = reads.get(&String::from_utf8_lossy(read_id_b).to_string()) {
+        if let Some(read_seq) = read_seq_opt {
             read_slice = read_seq[from.read_start..to.read_end].to_string();
             if !from.graph_pos.orientation {
                 rc = true;
@@ -186,10 +277,7 @@ fn process_chain_alignment(
 
                 let mut gaf = get_gaf_from_recalign_output(&recalign_output.stdout, rc);
                 // fix: use actual read length, not the slice length recalign saw
-                gaf.query_length = reads
-                    .get(&String::from_utf8_lossy(read_id_b).to_string())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                gaf.query_length = read_seq_opt.map(|s| s.len()).unwrap_or(0);
                 // update read_start and read_end to be relative to the whole read
                 gaf.query_start += from.read_start;
                 gaf.query_end += from.read_start;
@@ -326,51 +414,6 @@ fn finalize_gaf_global_coords_from_chain(
     if gaf.path_start > gaf.path_end {
         std::mem::swap(&mut gaf.path_start, &mut gaf.path_end);
     }
-}
-
-fn split_reads_alignment(output: &[u8]) -> Vec<(Vec<u8>, Chain, String)> {
-    let mut reads_alignments = Vec::new();
-    let mut current_read_alignment = String::new();
-    let mut current_primary_line = String::new();
-    let mut read_id: Vec<u8> = Vec::new();
-    let lines = output.split(|&b| b == b'\n').into_iter();
-    //first line is always the read ID
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if line[0] == b'*' {
-            current_read_alignment.push_str(&String::from_utf8_lossy(line));
-            current_read_alignment.push('\n');
-        } else {
-            if !current_read_alignment.is_empty() {
-                let chain = chain::build_chain(&current_read_alignment);
-                reads_alignments.push((read_id.clone(), chain, current_primary_line.clone()));
-                current_read_alignment.clear();
-            }
-            read_id = line.split(|&b| b == b'\t').next().unwrap().to_vec();
-            current_primary_line = String::from_utf8_lossy(line).to_string();
-        }
-    }
-    // flush last read
-    if !current_read_alignment.is_empty() {
-        let chain = chain::build_chain(&current_read_alignment);
-        reads_alignments.push((read_id.clone(), chain, current_primary_line.clone()));
-    }
-    /*
-    println!(
-        "Total reads alignments parsed: {:#?}",
-        reads_alignments.len()
-    );
-    for (rid, chain) in reads_alignments.iter() {
-        println!(
-            "Read ID: {}, Alignment:\n{:#?}",
-            String::from_utf8_lossy(&rid),
-            chain
-        );
-    }
-     */
-    reads_alignments
 }
 
 fn gaf_from_minigraph_primary_line(line: &str) -> Option<rg_exp::gaf::GAFStruct> {

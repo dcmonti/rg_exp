@@ -20,22 +20,41 @@ pub fn index_paths(gfa_file: &str) -> PathIndex {
         index.add_node(segment.name.clone(), segment.sequence.clone());
     }
 
+    // GFA pangenome graphs use segmented walks: the same logical haplotype path is split
+    // into many W-line segments with identical names. Assigning a unique path_id per segment
+    // means two nodes in different segments of the same haplotype never share a path_id,
+    // causing common_paths() to return empty and downstream crashes. Fix: merge all segments
+    // sharing the same path name into one logical path with globally-consistent positions.
+    let mut name_to_id: HashMap<Vec<u8>, usize> = HashMap::new();
+
     for p in &gfa.paths {
-        let new_path_id = index.paths_to_ids.len();
-        index.paths_to_ids.insert(new_path_id, p.path_name.clone());
-        let mut nodes_in_path = Vec::new();
-        p.iter()
+        let path_id = if let Some(&id) = name_to_id.get(&p.path_name) {
+            id
+        } else {
+            let id = name_to_id.len();
+            name_to_id.insert(p.path_name.clone(), id);
+            index.paths_to_ids.insert(id, p.path_name.clone());
+            index.paths.insert(id, PathInfo::new(p.path_name.clone(), Vec::new()));
+            id
+        };
+
+        let path_offset = index.paths[&path_id].nodes.len();
+
+        let new_nodes: Vec<(Vec<u8>, bool, usize)> = p.iter()
             .enumerate()
-            .for_each(|(position, (node_id, orientation))| {
-                index.update_path_occurrence(node_id, new_path_id, position);
-                let dir = if orientation == gfa::gfa::Orientation::Forward {
-                    true
-                } else {
-                    false
-                };
-                nodes_in_path.push((node_id.to_vec(), dir));
-            });
-        index.add_path(new_path_id, p.path_name.clone(), nodes_in_path);
+            .map(|(local_pos, (node_id, orientation))| {
+                (node_id.to_vec(), orientation == gfa::gfa::Orientation::Forward, path_offset + local_pos)
+            })
+            .collect();
+
+        for (node_id, _, global_pos) in &new_nodes {
+            index.update_path_occurrence(node_id, path_id, *global_pos);
+        }
+
+        let path_info = index.paths.get_mut(&path_id).unwrap();
+        for (node_id, dir, _) in new_nodes {
+            path_info.nodes.push((node_id, dir));
+        }
     }
     eprintln!("Indexed {} paths.", index.paths.len());
     index

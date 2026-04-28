@@ -123,6 +123,12 @@ fn process_chain_stream<R: BufRead>(
         if pending.len() >= ALIGNMENT_CHUNK_SIZE {
             chunk_no += 1;
             process_one_chunk(&pending, reads, index, pool, chunk_no);
+            // Ensure any mirrored minigraph output is flushed to disk promptly.
+            if let Some(f) = mirror_out.as_mut() {
+                if let Err(e) = f.flush() {
+                    eprintln!("Warning: failed to flush mirror file after chunk {}: {}", chunk_no, e);
+                }
+            }
             pending.clear();
         }
     }
@@ -135,6 +141,11 @@ fn process_chain_stream<R: BufRead>(
     if !pending.is_empty() {
         chunk_no += 1;
         process_one_chunk(&pending, reads, index, pool, chunk_no);
+        if let Some(f) = mirror_out.as_mut() {
+            if let Err(e) = f.flush() {
+                eprintln!("Warning: failed to flush mirror file after final chunk {}: {}", chunk_no, e);
+            }
+        }
     }
 }
 
@@ -164,8 +175,13 @@ fn process_one_chunk(
     }
 
     // Force progressive writes even when stdout is redirected to file/pipe.
-    if let Err(e) = std::io::stdout().flush() {
-        eprintln!("Warning: failed to flush stdout after chunk {}: {}", chunk_no, e);
+    // Lock stdout before flushing for more reliable behavior under heavy concurrency.
+    {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        if let Err(e) = handle.flush() {
+            eprintln!("Warning: failed to flush stdout after chunk {}: {}", chunk_no, e);
+        }
     }
     eprintln!("Chunk {} flushed ({} chains).", chunk_no, chunk.len());
 }

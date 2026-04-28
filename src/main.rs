@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
-const ALIGNMENT_CHUNK_SIZE: usize = 100;
+const ALIGNMENT_CHUNK_SIZE: usize = 10000;
 
 fn main() {
     let args = parser::Args::parse();
@@ -264,6 +264,7 @@ fn process_chain_alignment(
             .arg("-") // read query from stdin
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .and_then(|mut child| {
                 {

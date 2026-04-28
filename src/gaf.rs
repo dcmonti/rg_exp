@@ -254,6 +254,13 @@ fn cigar_stats(cigar: &str) -> CigarStats {
     s
 }
 
+fn nm_from_cigar(cigar: &str) -> usize {
+    parse_cigar_ops(cigar)
+        .iter()
+        .filter_map(|(n, op)| if matches!(op, 'X' | 'I' | 'D') { Some(*n) } else { None })
+        .sum()
+}
+
 fn extract_cigar_from_comments(comments: &str) -> Option<String> {
     if let Some(tag) = comments.split('\t').find(|t| t.starts_with("cg:Z:")) {
         return Some(tag[5..].to_string());
@@ -511,6 +518,24 @@ impl GAFStruct {
             comments,
         }
     }
+    // Converts recalign's @CO,... comment format to standard minigraph-style SAM tags.
+    // No-ops if comments are already in tag format (e.g. from a minigraph primary line).
+    pub fn convert_to_minigraph_comments(&mut self) {
+        if !self.comments.starts_with("@CO,") {
+            return;
+        }
+        let raw_cigar = extract_cigar_from_comments(&self.comments).unwrap_or_default();
+        let cigar = raw_cigar.replace('M', "="); // recalign M == exact match
+        let nm = nm_from_cigar(&cigar);
+        let block = self.alignment_block_length.parse::<usize>().unwrap_or(0);
+        let dv = if block > 0 { nm as f64 / block as f64 } else { 0.0 };
+        let mut tags = format!("tp:A:P\tNM:i:{}\tdv:f:{:.4}", nm, dv);
+        if !cigar.is_empty() {
+            tags.push_str(&format!("\tcg:Z:{}", cigar));
+        }
+        self.comments = tags;
+    }
+
     pub fn to_string(self) -> String {
         let dir = if self.path_dir == '>' { ">" } else { "<" };
         let path_matching: String = self

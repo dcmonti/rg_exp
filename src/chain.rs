@@ -3,6 +3,66 @@ use std::fmt::Display;
 use gfa::gfa::GFA;
 use crate::graph_index;
 
+// Walks forward through `nodes` starting at `start_from` until accumulated length
+// (starting from `already_accumulated`) reaches `target`.
+// Returns (last_idx, trim): last_idx is the last included node index; trim is Some(k) when the
+// boundary node should keep only its first k bytes.
+fn walk_forward(
+    nodes: &[(Vec<u8>, bool)],
+    index: &graph_index::PathIndex,
+    start_from: usize,
+    already_accumulated: usize,
+    target: usize,
+) -> (usize, Option<usize>) {
+    if already_accumulated >= target || start_from >= nodes.len() {
+        return (start_from.saturating_sub(1), None);
+    }
+    let mut curr = already_accumulated;
+    let mut en = start_from;
+    let mut trim = None;
+    while curr < target && en < nodes.len() {
+        let nlen = index.get(&nodes[en].0).unwrap().segment.len();
+        if curr + nlen >= target {
+            trim = Some(target - curr);
+            curr = target;
+        } else {
+            curr += nlen;
+        }
+        en += 1;
+    }
+    (en.saturating_sub(1), trim)
+}
+
+// Walks backward through `nodes` starting just below `anchor_idx` until accumulated length
+// (starting from `already_accumulated`) reaches `target`.
+// Returns (first_idx, trim): first_idx is the lowest included index; trim is Some(k) when the
+// boundary node should keep only its last k bytes.
+fn walk_backward(
+    nodes: &[(Vec<u8>, bool)],
+    index: &graph_index::PathIndex,
+    anchor_idx: usize,
+    already_accumulated: usize,
+    target: usize,
+) -> (usize, Option<usize>) {
+    if already_accumulated >= target {
+        return (anchor_idx, None);
+    }
+    let mut curr = already_accumulated;
+    let mut st = anchor_idx;
+    let mut trim = None;
+    while curr < target && st > 0 {
+        st -= 1;
+        let nlen = index.get(&nodes[st].0).unwrap().segment.len();
+        if curr + nlen >= target {
+            trim = Some(target - curr);
+            curr = target;
+        } else {
+            curr += nlen;
+        }
+    }
+    (st, trim)
+}
+
 pub fn build_chain(alignment: &str) -> Chain {
     // Chain from minigraph alignment output parsing logic goes here
     // Expected input:
@@ -43,7 +103,11 @@ pub fn extract_subgraph(
     let to_node = &to_anchor.graph_pos.node_id;
     // reversed = anchors map to the reverse strand; from_node comes AFTER to_node in path order
     let reversed = !from_anchor.graph_pos.orientation;
-    let paths_to_keep = path_index.common_paths(from_node, to_node);
+    //let paths_to_keep = path_index.both_paths(from_node, to_node);
+    let mut paths_to_keep = path_index.common_paths(from_node, to_node);
+    if paths_to_keep.len() == 0 {
+        paths_to_keep = path_index.both_paths(from_node, to_node);
+    }
     let mut subgraph: GFA<Vec<u8>, ()> = GFA::new();
     let mut segments_set = std::collections::HashSet::new();
 
@@ -51,60 +115,46 @@ pub fn extract_subgraph(
         let path_name = &path_index.paths_to_ids[&path_id];
         let path_nodes_list = &path_index.paths[&path_id].nodes;
 
-        // Compute (st_idx, en_idx) as a sorted [lo, hi] range to slice path_nodes_list.
-        // `reversed` controls iteration order and orientation flipping later.
-        let (st_idx, en_idx) = match relation {
+        // Compute (st_idx, en_idx, boundary_trim) for the subgraph range.
+        // boundary_trim = Some((is_low_boundary, keep_len)):
+        //   is_low_boundary=true  -> st_idx is the boundary node; keep its last keep_len bytes
+        //   is_low_boundary=false -> en_idx is the boundary node; keep its first keep_len bytes
+        // Anchor effective lengths account for the partial inclusion of from_node/to_node.
+        let (st_idx, en_idx, boundary_trim): (usize, usize, Option<(bool, usize)>) = match relation {
             graph_index::PathRelation::Both => {
                 let from_idx = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
                 let to_idx   = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().1;
-                // For reversed reads from_node is after to_node in path order, so from_idx > to_idx.
-                // Normalise to lo..=hi; iteration direction is decided below.
-                if from_idx <= to_idx { (from_idx, to_idx) } else { (to_idx, from_idx) }
+                let (s, e) = if from_idx <= to_idx { (from_idx, to_idx) } else { (to_idx, from_idx) };
+                (s, e, None)
             },
             graph_index::PathRelation::First => {
-                // Only from_node is in this path.
                 let anchor_idx = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
+                let from_full_len = path_index.get(from_node).unwrap().segment.len();
                 if reversed {
-                    // Reversed: walk backward (toward lower indices) from from_node.
-                    let mut st = anchor_idx;
-                    let mut curr_len = 0;
-                    while curr_len < substr_len && st > 0 {
-                        curr_len += path_index.get(&path_nodes_list[st].0).unwrap().segment.len();
-                        st -= 1;
-                    }
-                    (st, anchor_idx)
+                    // from_node kept as [..position.1]; effective contribution = position.1
+                    let effective = from_anchor.graph_pos.position.1;
+                    let (st, trim) = walk_backward(path_nodes_list, path_index, anchor_idx, effective, substr_len);
+                    (st, anchor_idx, trim.map(|k| (true, k)))
                 } else {
-                    // Forward: walk forward (toward higher indices) from from_node.
-                    let mut en = anchor_idx;
-                    let mut curr_len = 0;
-                    while curr_len < substr_len && en < path_nodes_list.len() {
-                        curr_len += path_index.get(&path_nodes_list[en].0).unwrap().segment.len();
-                        en += 1;
-                    }
-                    (anchor_idx, en)
+                    // from_node kept as [position.0..]; effective contribution = full_len - position.0
+                    let effective = from_full_len.saturating_sub(from_anchor.graph_pos.position.0);
+                    let (en, trim) = walk_forward(path_nodes_list, path_index, anchor_idx + 1, effective, substr_len);
+                    (anchor_idx, en, trim.map(|k| (false, k)))
                 }
             },
             graph_index::PathRelation::Second => {
-                // Only to_node is in this path.
                 let anchor_idx = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().1;
+                let to_full_len = path_index.get(to_node).unwrap().segment.len();
                 if reversed {
-                    // Reversed: walk forward (toward higher indices) from to_node.
-                    let mut en = anchor_idx;
-                    let mut curr_len = 0;
-                    while curr_len < substr_len && en < path_nodes_list.len() {
-                        curr_len += path_index.get(&path_nodes_list[en].0).unwrap().segment.len();
-                        en += 1;
-                    }
-                    (anchor_idx, en)
+                    // to_node kept as [position.0..]; effective contribution = full_len - position.0
+                    let effective = to_full_len.saturating_sub(to_anchor.graph_pos.position.0);
+                    let (en, trim) = walk_forward(path_nodes_list, path_index, anchor_idx + 1, effective, substr_len);
+                    (anchor_idx, en, trim.map(|k| (false, k)))
                 } else {
-                    // Forward: walk backward (toward lower indices) to to_node.
-                    let mut st = anchor_idx;
-                    let mut curr_len = 0;
-                    while curr_len < substr_len && st > 0 {
-                        curr_len += path_index.get(&path_nodes_list[st].0).unwrap().segment.len();
-                        st -= 1;
-                    }
-                    (st, anchor_idx)
+                    // to_node kept as [..position.1]; effective contribution = position.1
+                    let effective = to_anchor.graph_pos.position.1;
+                    let (st, trim) = walk_backward(path_nodes_list, path_index, anchor_idx, effective, substr_len);
+                    (st, anchor_idx, trim.map(|k| (true, k)))
                 }
             },
         };
@@ -112,13 +162,14 @@ pub fn extract_subgraph(
         let st_idx = st_idx.min(path_nodes_list.len().saturating_sub(1));
         let en_idx = en_idx.min(path_nodes_list.len().saturating_sub(1));
         let (st_idx, en_idx) = if st_idx <= en_idx { (st_idx, en_idx) } else { (en_idx, st_idx) };
+        let range_len = en_idx - st_idx;
 
         let mut path_nodes = Vec::new();
 
         // Always iterate in path order. For reversed reads, from_node sits at the high
         // end and to_node at the low end of the range; the RC'd read (sent to recalign)
         // aligns left-to-right against the forward-orientation path segments.
-        for (node_id, path_orientation) in &path_nodes_list[st_idx..=en_idx] {
+        for (rel_i, (node_id, path_orientation)) in path_nodes_list[st_idx..=en_idx].iter().enumerate() {
             let mut seq_slice: &[u8] = path_index.get(node_id).unwrap().segment.as_slice();
 
             if node_id == from_node {
@@ -138,6 +189,23 @@ pub fn extract_subgraph(
                     seq_slice = &seq_slice[to_anchor.graph_pos.position.0..];
                 } else {
                     seq_slice = &seq_slice[..to_anchor.graph_pos.position.1];
+                }
+            }
+            // Trim the boundary node (only applies to non-anchor nodes in First/Second cases).
+            if node_id != from_node && node_id != to_node {
+                if let Some((is_low_boundary, keep_len)) = boundary_trim {
+                    let is_boundary = (is_low_boundary && rel_i == 0)
+                        || (!is_low_boundary && rel_i == range_len);
+                    if is_boundary {
+                        let len = seq_slice.len();
+                        if is_low_boundary {
+                            // backward walk: boundary is first in path order; keep its tail
+                            seq_slice = &seq_slice[len.saturating_sub(keep_len)..];
+                        } else {
+                            // forward walk: boundary is last in path order; keep its head
+                            seq_slice = &seq_slice[..keep_len.min(len)];
+                        }
+                    }
                 }
             }
 

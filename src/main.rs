@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
-const ALIGNMENT_CHUNK_SIZE: usize = 10000;
+const ALIGNMENT_CHUNK_SIZE: usize = 100;
 
 fn main() {
     let args = parser::Args::parse();
@@ -244,13 +244,20 @@ fn process_chain_alignment(
             read_slice = String::new();
         }
         // build the subgraph between from and to
-        let subgraph = chain::extract_subgraph(from, to, index, read_slice.len());
+        let subgraph = chain::extract_subgraph(from, to, index, read_slice.len() + (read_slice.len() / 100)); // heuristic: allow some slack for indels in the read
         let mut gfa_out = String::new();
         gfa::writer::write_gfa(&subgraph, &mut gfa_out);
         gfa_out.insert_str(0, "GRAPH:\n");
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
-
+        // debug log for subgraph and read slice
+        eprintln!(
+            "SUBGRAPH:\n{}\nREAD SLICE:\n>{}\n{}",
+            gfa_out,
+            String::from_utf8_lossy(read_id_b),
+            read_slice
+        );
         // do alignment with recalign
+        let recalign_t0 = std::time::Instant::now();
         let run_recalign = Command::new(RECALIGN_BIN)
             .arg("-efast")
             .arg("-s8")
@@ -280,14 +287,25 @@ fn process_chain_alignment(
                 }
                 child.wait_with_output()
             });
+        let elapsed = recalign_t0.elapsed().as_secs();
+        if elapsed > 10 {
+            eprintln!(
+                "SLOW recalign: read {} anchors ({}->{}) took {}s",
+                String::from_utf8_lossy(read_id_b),
+                String::from_utf8_lossy(&from.graph_pos.node_id),
+                String::from_utf8_lossy(&to.graph_pos.node_id),
+                elapsed
+            );
+        }
 
         match run_recalign {
             Ok(recalign_output) => {
                 if !recalign_output.status.success() {
                     eprintln!(
-                        "Recalign failed for anchor pair ({} -> {}), skipping.",
+                        "Recalign failed for anchor pair ({} -> {}) with error {}, skipping.",
                         String::from_utf8_lossy(&from.graph_pos.node_id),
-                        String::from_utf8_lossy(&to.graph_pos.node_id)
+                        String::from_utf8_lossy(&to.graph_pos.node_id),
+                        String::from_utf8_lossy(&recalign_output.stderr)
                     );
                     continue;
                 }
@@ -321,6 +339,7 @@ fn process_chain_alignment(
     chain_gaf.map(|mut gaf| {
         finalize_gaf_global_coords_from_chain(&mut gaf, chain_b, index);
         gaf.reconcile_cigar_with_spans();
+        gaf.convert_to_minigraph_comments();
         // Match minigraph convention: strand on primary record is '+' and
         // path orientation is represented in the path string itself.
         gaf.strand = '+';

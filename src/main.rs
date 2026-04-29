@@ -199,7 +199,15 @@ fn make_anchor_gaf(
     let q_span = anchor.read_end.saturating_sub(anchor.read_start);
     let r_span = anchor.graph_pos.position.1.saturating_sub(anchor.graph_pos.position.0);
     let match_len = q_span.min(r_span);
-    let comments = format!("tp:A:P\tNM:i:0\tdv:f:0.0000\tcg:Z:{}=", match_len);
+    // Build a CIGAR that is consistent with both query span and reference span.
+    // When they differ, the shorter side is fully matched and the excess is I or D.
+    let cigar = match q_span.cmp(&r_span) {
+        std::cmp::Ordering::Equal   => format!("{}=", match_len),
+        std::cmp::Ordering::Greater => format!("{}={}I", r_span, q_span - r_span),
+        std::cmp::Ordering::Less    => format!("{}={}D", q_span, r_span - q_span),
+    };
+    let alignment_block = q_span.max(r_span);
+    let comments = format!("tp:A:P\tNM:i:0\tdv:f:0.0000\tcg:Z:{}", cigar);
     let path_dir = if anchor.graph_pos.orientation { '>' } else { '<' };
     rg_exp::gaf::GAFStruct::build_gaf_struct(
         read_id.to_string(),
@@ -213,7 +221,7 @@ fn make_anchor_gaf(
         path_offset,
         path_offset + r_span,
         match_len,
-        match_len.to_string(),
+        alignment_block.to_string(),
         "60".to_string(),
         comments,
     )
@@ -247,10 +255,20 @@ fn process_chain_alignment(
     let read_seq_opt = reads.get(&read_id_str);
     let full_read_len = read_seq_opt.map(|s| s.len()).unwrap_or(0);
     let mut chain_gaf: Option<rg_exp::gaf::GAFStruct> = None;
-    // running_path_offset tracks cumulative reference consumed, giving all pieces
-    // a consistent global coordinate system so merge_gafs min(path_start) is correct.
-    let mut running_path_offset: usize = 0;
     let anchors = &chain_b.anchors;
+    // Initialise path offset at the position of the first anchor within its node,
+    // measured along the path direction (< or >).  This makes path_start match the
+    // reference-path convention (offset from the beginning of the full node sequence).
+    let initial_path_start = {
+        let a = &anchors[0];
+        let node_full_len = index.get(&a.graph_pos.node_id).map(|n| n.segment.len()).unwrap_or(0);
+        if a.graph_pos.orientation {
+            a.graph_pos.position.0
+        } else {
+            node_full_len.saturating_sub(a.graph_pos.position.1)
+        }
+    };
+    let mut running_path_offset: usize = initial_path_start;
 
     for i in 0..anchors.len() {
         let anchor = &anchors[i];
@@ -397,6 +415,12 @@ fn process_chain_alignment(
     }
 
     chain_gaf.map(|mut gaf| {
+        // path_length = sum of full node lengths (reference convention, not just aligned span).
+        let full_path_len: usize = gaf.path.iter()
+            .filter_map(|id| index.get(id.to_string().as_bytes()))
+            .map(|ni| ni.segment.len())
+            .sum();
+        gaf.path_length = full_path_len;
         gaf.reconcile_cigar_with_spans();
         gaf.convert_to_minigraph_comments();
         gaf.strand = '+';

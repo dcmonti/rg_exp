@@ -6,3 +6,9 @@ Cargo.lock
 *.out
 /scripts
 /test_data
+*.py
+*.gaf
+*.fa
+*.fasta
+*.fq
+*.fastq

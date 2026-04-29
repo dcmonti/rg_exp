@@ -518,22 +518,39 @@ impl GAFStruct {
             comments,
         }
     }
-    // Converts recalign's @CO,... comment format to standard minigraph-style SAM tags.
-    // No-ops if comments are already in tag format (e.g. from a minigraph primary line).
+    // Normalises comments to minigraph-style SAM tags and recomputes NM/dv from the
+    // current (post-merge) CIGAR. Works on both @CO,... and already-tag-format comments.
     pub fn convert_to_minigraph_comments(&mut self) {
-        if !self.comments.starts_with("@CO,") {
-            return;
-        }
         let raw_cigar = extract_cigar_from_comments(&self.comments).unwrap_or_default();
         let cigar = raw_cigar.replace('M', "="); // recalign M == exact match
         let nm = nm_from_cigar(&cigar);
         let block = self.alignment_block_length.parse::<usize>().unwrap_or(0);
         let dv = if block > 0 { nm as f64 / block as f64 } else { 0.0 };
-        let mut tags = format!("tp:A:P\tNM:i:{}\tdv:f:{:.4}", nm, dv);
-        if !cigar.is_empty() {
-            tags.push_str(&format!("\tcg:Z:{}", cigar));
+
+        if self.comments.starts_with("@CO,") {
+            let mut tags = format!("tp:A:P\tNM:i:{}\tdv:f:{:.4}", nm, dv);
+            if !cigar.is_empty() {
+                tags.push_str(&format!("\tcg:Z:{}", cigar));
+            }
+            self.comments = tags;
+        } else {
+            // Already tag format: update NM, dv and CIGAR in-place.
+            let mut tags: Vec<String> = self.comments.split('\t').map(|s| s.to_string()).collect();
+            if let Some(i) = tags.iter().position(|t| t.starts_with("NM:i:")) {
+                tags[i] = format!("NM:i:{}", nm);
+            }
+            if let Some(i) = tags.iter().position(|t| t.starts_with("dv:f:")) {
+                tags[i] = format!("dv:f:{:.4}", dv);
+            }
+            if !cigar.is_empty() {
+                if let Some(i) = tags.iter().position(|t| t.starts_with("cg:Z:")) {
+                    tags[i] = format!("cg:Z:{}", cigar);
+                } else {
+                    tags.push(format!("cg:Z:{}", cigar));
+                }
+            }
+            self.comments = tags.join("\t");
         }
-        self.comments = tags;
     }
 
     pub fn to_string(self) -> String {

@@ -106,6 +106,11 @@ pub fn extract_subgraph(
     //let paths_to_keep = path_index.both_paths(from_node, to_node);
     let mut paths_to_keep = path_index.common_paths(from_node, to_node);
     if paths_to_keep.len() == 0 {
+        eprintln!(
+            "Warning: no common paths found between from_node {} and to_node {}. Falling back to both_paths.",
+            String::from_utf8_lossy(from_node),
+            String::from_utf8_lossy(to_node)
+        );
         paths_to_keep = path_index.both_paths(from_node, to_node);
     }
     let mut subgraph: GFA<Vec<u8>, ()> = GFA::new();
@@ -174,22 +179,25 @@ pub fn extract_subgraph(
 
             if node_id == from_node {
                 if reversed {
-                    // from_node is the LAST segment for the RC'd read; trim like a to_node
-                    // in the forward case: keep [..s_end] so the gap toward the next anchor
-                    // is included.
-                    seq_slice = &seq_slice[..from_anchor.graph_pos.position.1];
+                    // gap starts before anchor start in forward coords: keep [..position.0]
+                    seq_slice = &seq_slice[..from_anchor.graph_pos.position.0];
                 } else {
-                    seq_slice = &seq_slice[from_anchor.graph_pos.position.0..];
+                    // gap starts after anchor end in forward coords: keep [position.1..]
+                    seq_slice = &seq_slice[from_anchor.graph_pos.position.1..];
                 }
             }
             if node_id == to_node {
                 if reversed {
-                    // to_node is the FIRST segment for the RC'd read; trim like a from_node
-                    // in the forward case: keep [s_start..] so the gap is included.
-                    seq_slice = &seq_slice[to_anchor.graph_pos.position.0..];
+                    // gap ends after anchor end in forward coords: keep [position.1..]
+                    seq_slice = &seq_slice[to_anchor.graph_pos.position.1..];
                 } else {
-                    seq_slice = &seq_slice[..to_anchor.graph_pos.position.1];
+                    // gap ends before anchor start in forward coords: keep [..position.0]
+                    seq_slice = &seq_slice[..to_anchor.graph_pos.position.0];
                 }
+            }
+
+            if seq_slice.is_empty() {
+                continue;
             }
             // Trim the boundary node (only applies to non-anchor nodes in First/Second cases).
             if node_id != from_node && node_id != to_node {

@@ -186,6 +186,39 @@ fn process_one_chunk(
     eprintln!("Chunk {} flushed ({} chains).", chunk_no, chunk.len());
 }
 
+fn make_anchor_gaf(
+    anchor: &rg_exp::chain::Anchor,
+    read_id: &str,
+    full_read_len: usize,
+    path_offset: usize,
+) -> rg_exp::gaf::GAFStruct {
+    let node_id_num = std::str::from_utf8(&anchor.graph_pos.node_id)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let q_span = anchor.read_end.saturating_sub(anchor.read_start);
+    let r_span = anchor.graph_pos.position.1.saturating_sub(anchor.graph_pos.position.0);
+    let match_len = q_span.min(r_span);
+    let comments = format!("tp:A:P\tNM:i:0\tdv:f:0.0000\tcg:Z:{}=", match_len);
+    let path_dir = if anchor.graph_pos.orientation { '>' } else { '<' };
+    rg_exp::gaf::GAFStruct::build_gaf_struct(
+        read_id.to_string(),
+        full_read_len,
+        anchor.read_start,
+        anchor.read_end,
+        '+',
+        path_dir,
+        vec![node_id_num],
+        path_offset + r_span,
+        path_offset,
+        path_offset + r_span,
+        match_len,
+        match_len.to_string(),
+        "60".to_string(),
+        comments,
+    )
+}
+
 fn process_chain_alignment(
     idx: usize,
     read_id_b: &Vec<u8>,
@@ -212,19 +245,46 @@ fn process_chain_alignment(
 
     let read_id_str = String::from_utf8_lossy(read_id_b).to_string();
     let read_seq_opt = reads.get(&read_id_str);
-    // Keep logs concise on large datasets.
+    let full_read_len = read_seq_opt.map(|s| s.len()).unwrap_or(0);
     let mut chain_gaf: Option<rg_exp::gaf::GAFStruct> = None;
-    for window in chain_b.anchors.windows(2) {
-        let from = &window[0];
-        let to = &window[1];
+    // running_path_offset tracks cumulative reference consumed, giving all pieces
+    // a consistent global coordinate system so merge_gafs min(path_start) is correct.
+    let mut running_path_offset: usize = 0;
+    let anchors = &chain_b.anchors;
+
+    for i in 0..anchors.len() {
+        let anchor = &anchors[i];
+
+        // Synthetic perfect-match GAF for this anchor (trusted by minigraph).
+        let anchor_ref_span = anchor.graph_pos.position.1.saturating_sub(anchor.graph_pos.position.0);
+        let anchor_gaf = make_anchor_gaf(anchor, &read_id_str, full_read_len, running_path_offset);
+        running_path_offset += anchor_ref_span;
+        chain_gaf = Some(match chain_gaf.take() {
+            Some(existing) => rg_exp::gaf::GAFStruct::merge_gafs(&existing, &anchor_gaf),
+            None => anchor_gaf,
+        });
+
+        if i + 1 >= anchors.len() {
+            break;
+        }
+        let from = anchor;
+        let to = &anchors[i + 1];
+
+        // align only the gap between the two anchors
+        if from.read_end >= to.read_start {
+            continue;
+        }
+        let gap_len = to.read_start - from.read_end;
+        if gap_len < 8 {
+            continue;
+        }
+
         let mut rc = false;
-        // get read sequence slice delimited by from and to
         let mut read_slice: String;
         if let Some(read_seq) = read_seq_opt {
-            read_slice = read_seq[from.read_start..to.read_end].to_string();
+            read_slice = read_seq[from.read_end..to.read_start].to_string();
             if !from.graph_pos.orientation {
                 rc = true;
-                // reverse complement
                 let revcomp: String = read_slice
                     .chars()
                     .rev()
@@ -243,32 +303,29 @@ fn process_chain_alignment(
             eprintln!("Read ID {} not found in reads", String::from_utf8_lossy(read_id_b));
             read_slice = String::new();
         }
-        // build the subgraph between from and to
-        let subgraph = chain::extract_subgraph(from, to, index, read_slice.len() + (read_slice.len() / 100)); // heuristic: allow some slack for indels in the read
+
+        let subgraph = chain::extract_subgraph(from, to, index, read_slice.len() + (read_slice.len() / 100));
         let mut gfa_out = String::new();
         gfa::writer::write_gfa(&subgraph, &mut gfa_out);
         gfa_out.insert_str(0, "GRAPH:\n");
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
-        // debug log for subgraph and read slice
         eprintln!(
-            "SUBGRAPH:\n{}\nREAD SLICE:\n>{}\n{}",
-            gfa_out,
-            String::from_utf8_lossy(read_id_b),
-            read_slice
+            "SUBGRAPH:\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
+            gfa_out, from.read_end, to.read_start,
+            String::from_utf8_lossy(read_id_b), read_slice
         );
-        // do alignment with recalign
+
         let recalign_t0 = std::time::Instant::now();
         let run_recalign = Command::new(RECALIGN_BIN)
             .arg("-efast")
             .arg("-s8")
-            .arg("-m")
             .arg("-k2")
             .arg("-r1")
             .arg("-t1")
             .arg("-g")
-            .arg("-") // read graph from stdin
+            .arg("-")
             .arg("-q")
-            .arg("-") // read query from stdin
+            .arg("-")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -277,16 +334,12 @@ fn process_chain_alignment(
                 {
                     let stdin = child.stdin.as_mut().expect("Failed to open stdin");
                     use std::io::Write;
-                    stdin
-                        .write_all(gfa_out.as_bytes())
-                        .expect("Failed to write graph to stdin");
-
-                    stdin
-                        .write_all(read_out.as_bytes())
-                        .expect("Failed to write read slice to stdin");
+                    stdin.write_all(gfa_out.as_bytes()).expect("Failed to write graph to stdin");
+                    stdin.write_all(read_out.as_bytes()).expect("Failed to write read to stdin");
                 }
                 child.wait_with_output()
             });
+
         let elapsed = recalign_t0.elapsed().as_secs();
         if elapsed > 10 {
             eprintln!(
@@ -311,16 +364,24 @@ fn process_chain_alignment(
                 }
 
                 let mut gaf = get_gaf_from_recalign_output(&recalign_output.stdout, rc);
-                // fix: use actual read length, not the slice length recalign saw
-                gaf.query_length = read_seq_opt.map(|s| s.len()).unwrap_or(0);
-                // update read_start and read_end to be relative to the whole read
-                gaf.query_start += from.read_start;
-                gaf.query_end += from.read_start;
+                gaf.query_length = full_read_len;
+                gaf.query_start += from.read_end;
+                gaf.query_end += from.read_end;
 
-                // project local subgraph path coordinates to global path coordinates
-                normalize_gaf_global_path_coords(&mut gaf, from, index);
+                // Replace recalign's local path coords with global running offset.
+                // gap_ref_span is path_end - path_start before any offset replacement,
+                // which equals reference_consumed by the CIGAR (consistent after RC too).
+                let gap_ref_span = gaf.path_end.saturating_sub(gaf.path_start);
+                gaf.path_start = running_path_offset;
+                gaf.path_end = running_path_offset + gap_ref_span;
+                gaf.path_length = gaf.path_end;
+                running_path_offset += gap_ref_span;
+                // The RC in get_gaf_from_recalign_output already mapped coordinates and
+                // reversed path/CIGAR into the original read's orientation. Force strand='+'
+                // so merge_gafs does not apply a second reverse_complement that would
+                // re-reverse path and CIGAR and duplicate nodes.
+                gaf.strand = '+';
 
-                // Accumulate per-chain only; do not merge across chains.
                 chain_gaf = Some(match chain_gaf.take() {
                     Some(existing) => rg_exp::gaf::GAFStruct::merge_gafs(&existing, &gaf),
                     None => gaf,
@@ -328,128 +389,19 @@ fn process_chain_alignment(
             }
             Err(e) => {
                 eprintln!(
-                    "Failed to execute recalign at '{}': {}. Build the submodule first (e.g. `cd recalign && cargo build --release`).",
-                    RECALIGN_BIN,
-                    e
+                    "Failed to execute recalign at '{}': {}. Build the submodule first.",
+                    RECALIGN_BIN, e
                 );
             }
         }
     }
 
     chain_gaf.map(|mut gaf| {
-        finalize_gaf_global_coords_from_chain(&mut gaf, chain_b, index);
         gaf.reconcile_cigar_with_spans();
         gaf.convert_to_minigraph_comments();
-        // Match minigraph convention: strand on primary record is '+' and
-        // path orientation is represented in the path string itself.
         gaf.strand = '+';
         (idx, read_id_str, gaf)
     })
-}
-
-fn path_total_len(index: &graph_index::PathIndex, node_path: &[usize]) -> usize {
-    node_path
-        .iter()
-        .filter_map(|id| index.get(id.to_string().as_bytes()))
-        .map(|ni| ni.segment.len())
-        .sum()
-}
-
-fn normalize_gaf_global_path_coords(
-    gaf: &mut rg_exp::gaf::GAFStruct,
-    from: &rg_exp::chain::Anchor,
-    index: &graph_index::PathIndex,
-) {
-    let total_len = path_total_len(index, &gaf.path);
-    if total_len == 0 {
-        return;
-    }
-
-    let anchor_node_len = index
-        .get(&from.graph_pos.node_id)
-        .map(|ni| ni.segment.len())
-        .unwrap_or(0);
-
-    // Use anchor offset as origin for this window in the oriented path coordinate space.
-    let base_offset = if gaf.strand == '+' {
-        from.graph_pos.position.0
-    } else {
-        anchor_node_len.saturating_sub(from.graph_pos.position.1)
-    };
-
-    gaf.path_length = total_len;
-    gaf.path_start = base_offset.saturating_add(gaf.path_start).min(total_len);
-    gaf.path_end = base_offset.saturating_add(gaf.path_end).min(total_len);
-}
-
-fn coord_on_gaf_path(
-    gaf: &rg_exp::gaf::GAFStruct,
-    anchor: &rg_exp::chain::Anchor,
-    use_start: bool,
-    index: &graph_index::PathIndex,
-) -> Option<usize> {
-    let anchor_id = std::str::from_utf8(&anchor.graph_pos.node_id)
-        .ok()?
-        .parse::<usize>()
-        .ok()?;
-
-    let mut prefix = 0usize;
-    for node in &gaf.path {
-        let node_len = index
-            .get(node.to_string().as_bytes())
-            .map(|ni| ni.segment.len())
-            .unwrap_or(0);
-        if *node == anchor_id {
-            let local = if gaf.strand == '+' {
-                if use_start {
-                    anchor.graph_pos.position.0
-                } else {
-                    anchor.graph_pos.position.1
-                }
-            } else if use_start {
-                node_len.saturating_sub(anchor.graph_pos.position.1)
-            } else {
-                node_len.saturating_sub(anchor.graph_pos.position.0)
-            };
-            return Some(prefix.saturating_add(local));
-        }
-        prefix = prefix.saturating_add(node_len);
-    }
-    None
-}
-
-fn finalize_gaf_global_coords_from_chain(
-    gaf: &mut rg_exp::gaf::GAFStruct,
-    chain: &rg_exp::chain::Chain,
-    index: &graph_index::PathIndex,
-) {
-    let total_len = path_total_len(index, &gaf.path);
-    if total_len == 0 || chain.anchors.is_empty() {
-        return;
-    }
-
-    gaf.path_length = total_len;
-
-    let first = match chain.anchors.first() {
-        Some(a) => a,
-        None => return,
-    };
-    let last = match chain.anchors.last() {
-        Some(a) => a,
-        None => return,
-    };
-
-    if let Some(ps) = coord_on_gaf_path(gaf, first, true, index) {
-        gaf.path_start = ps.min(total_len);
-    }
-
-    if let Some(pe) = coord_on_gaf_path(gaf, last, false, index) {
-        gaf.path_end = pe.min(total_len);
-    }
-
-    if gaf.path_start > gaf.path_end {
-        std::mem::swap(&mut gaf.path_start, &mut gaf.path_end);
-    }
 }
 
 fn gaf_from_minigraph_primary_line(line: &str) -> Option<rg_exp::gaf::GAFStruct> {

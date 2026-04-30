@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
-const ALIGNMENT_CHUNK_SIZE: usize = 5000;
+const ALIGNMENT_CHUNK_SIZE: usize = 1000;
 
 fn main() {
     let args = parser::Args::parse();
@@ -328,7 +328,9 @@ fn process_chain_alignment(
         gfa_out.insert_str(0, "GRAPH:\n");
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
         //eprintln!(
-        //    "SUBGRAPH:\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
+        //    "SUBGRAPH (anchor {}->{}):\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
+        //    String::from_utf8_lossy(&from.graph_pos.node_id),
+        //    String::from_utf8_lossy(&to.graph_pos.node_id),
         //    gfa_out, from.read_end, to.read_start,
         //    String::from_utf8_lossy(read_id_b), read_slice
         //);

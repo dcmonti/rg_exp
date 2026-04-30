@@ -234,6 +234,9 @@ pub fn extract_subgraph(
             path_nodes.extend_from_slice(&new_node);
         }
 
+        if path_nodes.is_empty() {
+            continue;
+        }
         path_nodes.pop(); // remove trailing comma
         path_nodes.extend_from_slice(b"\t*");
         let new_path: gfa::gfa::Path<Vec<u8>, _> = gfa::gfa::Path::new(

@@ -171,7 +171,20 @@ fn process_one_chunk(
 
     // print gafs (one line per chain; multi-mapping reads yield multiple lines)
     for (_, _read_id, gaf) in gafs.iter() {
-        println!("{}", gaf.clone().to_string());
+        let mut line = gaf.clone().to_string();
+        if let Some(pos) = line.find("cg:Z:") {
+            let start = pos + "cg:Z:".len();
+            let end = match line[start..].find('\t') {
+                Some(i) => start + i,
+                None => line.len(),
+            };
+            let cg = &line[start..end];
+            let merged = merge_cigar(cg);
+            if merged != cg {
+                line.replace_range(start..end, &merged);
+            }
+        }
+        println!("{}", line);
     }
 
     // Force progressive writes even when stdout is redirected to file/pipe.
@@ -471,6 +484,36 @@ fn gaf_from_minigraph_primary_line(line: &str) -> Option<rg_exp::gaf::GAFStruct>
         fields[11].to_string(),
         comments,
     ))
+}
+
+fn merge_cigar(cigar: &str) -> String {
+    let mut res = String::new();
+    let mut num: usize = 0;
+    let mut last_op: Option<char> = None;
+    let mut acc: usize = 0;
+    for ch in cigar.chars() {
+        if ch.is_ascii_digit() {
+            num = num * 10 + (ch as u8 - b'0') as usize;
+        } else {
+            match last_op {
+                Some(op) if op == ch => acc += num,
+                Some(op) => {
+                    res.push_str(&format!("{}{}", acc, op));
+                    acc = num;
+                    last_op = Some(ch);
+                }
+                None => {
+                    acc = num;
+                    last_op = Some(ch);
+                }
+            }
+            num = 0;
+        }
+    }
+    if let Some(op) = last_op {
+        res.push_str(&format!("{}{}", acc, op));
+    }
+    res
 }
 
 fn get_gaf_from_recalign_output(output: &[u8], rc: bool) -> rg_exp::gaf::GAFStruct {

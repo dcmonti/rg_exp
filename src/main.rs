@@ -310,32 +310,30 @@ fn process_chain_alignment(
             continue;
         }
 
-        let mut rc = false;
         let mut read_slice: String;
         if let Some(read_seq) = read_seq_opt {
             read_slice = read_seq[from.read_end..to.read_start].to_string();
-            if !from.graph_pos.orientation {
-                rc = true;
-                let revcomp: String = read_slice
-                    .chars()
-                    .rev()
-                    .map(|c| match c {
-                        'A' => 'T',
-                        'T' => 'A',
-                        'C' => 'G',
-                        'G' => 'C',
-                        'N' => 'N',
-                        _ => c,
-                    })
-                    .collect();
-                read_slice = revcomp;
-            }
         } else {
             eprintln!("Read ID {} not found in reads", String::from_utf8_lossy(read_id_b));
             read_slice = String::new();
         }
 
-        let subgraph = chain::extract_subgraph(from, to, index, read_slice.len() + (read_slice.len() / 100));
+        let (subgraph, rc) = chain::extract_subgraph(from, to, index, read_slice.len() + (read_slice.len() / 100));
+        if rc {
+            let revcomp: String = read_slice
+                .chars()
+                .rev()
+                .map(|c| match c {
+                    'A' => 'T',
+                    'T' => 'A',
+                    'C' => 'G',
+                    'G' => 'C',
+                    'N' => 'N',
+                    _ => c,
+                })
+                .collect();
+            read_slice = revcomp;
+        }
         let mut gfa_out = String::new();
         gfa::writer::write_gfa(&subgraph, &mut gfa_out);
         gfa_out.insert_str(0, "GRAPH:\n");

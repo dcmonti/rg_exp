@@ -98,11 +98,10 @@ pub fn extract_subgraph(
     to_anchor: &Anchor,
     path_index: &graph_index::PathIndex,
     substr_len: usize,
-) -> GFA<Vec<u8>, ()> {
+) -> (GFA<Vec<u8>, ()>, bool) {
     let from_node = &from_anchor.graph_pos.node_id;
     let to_node = &to_anchor.graph_pos.node_id;
-    // reversed = anchors map to the reverse strand; from_node comes AFTER to_node in path order
-    let reversed = !from_anchor.graph_pos.orientation;
+    let mut rc_hint: Option<bool> = None;
     //let paths_to_keep = path_index.both_paths(from_node, to_node);
     let mut paths_to_keep = path_index.common_paths(from_node, to_node);
     if paths_to_keep.len() == 0 {
@@ -127,41 +126,62 @@ pub fn extract_subgraph(
         // Anchor effective lengths account for the partial inclusion of from_node/to_node.
         // flip_path: path stores from_node after to_node; iterate in reverse + flip orientations
         // so that the subgraph path always goes from_node → to_node, matching the read direction.
-        let (st_idx, en_idx, boundary_trim, flip_path): (usize, usize, Option<(bool, usize)>, bool) = match relation {
+        let (st_idx, en_idx, boundary_trim, flip_path, anchor_path_orientation): (usize, usize, Option<(bool, usize)>, bool, bool) = match relation {
             graph_index::PathRelation::Both => {
                 let from_pos = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
                 let to_pos   = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().0;
                 let flip = from_pos > to_pos;
+                let mut from_path_orientation = path_nodes_list[from_pos].1;
+                if flip {
+                    from_path_orientation = !from_path_orientation;
+                }
                 let (s, e) = if !flip { (from_pos, to_pos) } else { (to_pos, from_pos) };
-                (s, e, None, flip)
+                (s, e, None, flip, from_path_orientation)
             },
             graph_index::PathRelation::First => {
                 let anchor_idx = path_index.get(from_node).unwrap().get_path_fl(&path_id).unwrap().0;
                 let from_full_len = path_index.get(from_node).unwrap().segment.len();
-                if reversed {
+                let anchor_path_orientation = path_nodes_list[anchor_idx].1;
+                if !anchor_path_orientation {
                     let effective = from_anchor.graph_pos.position.1;
                     let (st, trim) = walk_backward(path_nodes_list, path_index, anchor_idx, effective, substr_len);
-                    (st, anchor_idx, trim.map(|k| (true, k)), false)
+                    (st, anchor_idx, trim.map(|k| (true, k)), false, anchor_path_orientation)
                 } else {
                     let effective = from_full_len.saturating_sub(from_anchor.graph_pos.position.0);
                     let (en, trim) = walk_forward(path_nodes_list, path_index, anchor_idx + 1, effective, substr_len);
-                    (anchor_idx, en, trim.map(|k| (false, k)), false)
+                    (anchor_idx, en, trim.map(|k| (false, k)), false, anchor_path_orientation)
                 }
             },
             graph_index::PathRelation::Second => {
                 let anchor_idx = path_index.get(to_node).unwrap().get_path_fl(&path_id).unwrap().0;
                 let to_full_len = path_index.get(to_node).unwrap().segment.len();
-                if reversed {
+                let anchor_path_orientation = path_nodes_list[anchor_idx].1;
+                if !anchor_path_orientation {
                     let effective = to_full_len.saturating_sub(to_anchor.graph_pos.position.0);
                     let (en, trim) = walk_forward(path_nodes_list, path_index, anchor_idx + 1, effective, substr_len);
-                    (anchor_idx, en, trim.map(|k| (false, k)), false)
+                    (anchor_idx, en, trim.map(|k| (false, k)), false, anchor_path_orientation)
                 } else {
                     let effective = to_anchor.graph_pos.position.1;
                     let (st, trim) = walk_backward(path_nodes_list, path_index, anchor_idx, effective, substr_len);
-                    (st, anchor_idx, trim.map(|k| (true, k)), false)
+                    (st, anchor_idx, trim.map(|k| (true, k)), false, anchor_path_orientation)
                 }
             },
         };
+
+        let path_rc = from_anchor.graph_pos.orientation != anchor_path_orientation;
+        if let Some(prev) = rc_hint {
+            if prev != path_rc {
+                eprintln!(
+                    "Warning: inconsistent RC hints across paths for {}->{} (prev={}, now={})",
+                    String::from_utf8_lossy(from_node),
+                    String::from_utf8_lossy(to_node),
+                    prev,
+                    path_rc
+                );
+            }
+        } else {
+            rc_hint = Some(path_rc);
+        }
 
         let st_idx = st_idx.min(path_nodes_list.len().saturating_sub(1));
         let en_idx = en_idx.min(path_nodes_list.len().saturating_sub(1));
@@ -180,7 +200,7 @@ pub fn extract_subgraph(
             let mut seq_slice: &[u8] = path_index.get(node_id).unwrap().segment.as_slice();
 
             if node_id == from_node {
-                if reversed {
+                if !path_orientation {
                     // gap starts before anchor start in forward coords: keep [..position.0]
                     seq_slice = &seq_slice[..from_anchor.graph_pos.position.0];
                 } else {
@@ -189,7 +209,7 @@ pub fn extract_subgraph(
                 }
             }
             if node_id == to_node {
-                if reversed {
+                if !path_orientation {
                     // gap ends after anchor end in forward coords: keep [position.1..]
                     seq_slice = &seq_slice[to_anchor.graph_pos.position.1..];
                 } else {
@@ -249,7 +269,7 @@ pub fn extract_subgraph(
         );
         subgraph.paths.push(new_path);
     }
-    subgraph
+    (subgraph, rc_hint.unwrap_or(false))
 }
 
 #[derive(Debug)]

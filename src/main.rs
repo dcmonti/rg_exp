@@ -8,9 +8,17 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
 const ALIGNMENT_CHUNK_SIZE: usize = 1000;
+
+fn recalign_timeout_secs() -> Option<u64> {
+    let raw = std::env::var("RECALIGN_TIMEOUT_SECS").ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    if secs == 0 { None } else { Some(secs) }
+}
 
 fn main() {
     let args = parser::Args::parse();
@@ -368,7 +376,34 @@ fn process_chain_alignment(
                     stdin.write_all(gfa_out.as_bytes()).expect("Failed to write graph to stdin");
                     stdin.write_all(read_out.as_bytes()).expect("Failed to write read to stdin");
                 }
-                child.wait_with_output()
+
+                if let Some(secs) = recalign_timeout_secs() {
+                    let timeout = Duration::from_secs(secs);
+                    match child.wait_timeout(timeout)? {
+                        Some(status) => {
+                            let mut stdout = Vec::new();
+                            if let Some(mut out) = child.stdout.take() {
+                                use std::io::Read;
+                                out.read_to_end(&mut stdout).ok();
+                            }
+                            Ok(std::process::Output {
+                                status,
+                                stdout,
+                                stderr: Vec::new(),
+                            })
+                        }
+                        None => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "recalign timed out",
+                            ));
+                        }
+                    }
+                } else {
+                    child.wait_with_output()
+                }
             });
 
         let elapsed = recalign_t0.elapsed().as_secs();

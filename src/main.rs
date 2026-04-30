@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
 const RECALIGN_BIN: &str = "recalign/target/release/recalign";
-const ALIGNMENT_CHUNK_SIZE: usize = 100;
+const ALIGNMENT_CHUNK_SIZE: usize = 5000;
 
 fn main() {
     let args = parser::Args::parse();
@@ -43,7 +43,7 @@ fn main() {
             .arg("-c")
             .arg("-S")
             .arg("-N0")
-            .arg("-t1")
+            .arg("-t16")
             .arg(&graph_path)
             .arg(&reads_path)
             .stdout(std::process::Stdio::piped())
@@ -327,11 +327,11 @@ fn process_chain_alignment(
         gfa::writer::write_gfa(&subgraph, &mut gfa_out);
         gfa_out.insert_str(0, "GRAPH:\n");
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
-        eprintln!(
-            "SUBGRAPH:\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
-            gfa_out, from.read_end, to.read_start,
-            String::from_utf8_lossy(read_id_b), read_slice
-        );
+        //eprintln!(
+        //    "SUBGRAPH:\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
+        //    gfa_out, from.read_end, to.read_start,
+        //    String::from_utf8_lossy(read_id_b), read_slice
+        //);
 
         let recalign_t0 = std::time::Instant::now();
         let run_recalign = Command::new(RECALIGN_BIN)
@@ -359,7 +359,7 @@ fn process_chain_alignment(
             });
 
         let elapsed = recalign_t0.elapsed().as_secs();
-        if elapsed > 10 {
+        if elapsed > 30 {
             eprintln!(
                 "SLOW recalign: read {} anchors ({}->{}) took {}s",
                 String::from_utf8_lossy(read_id_b),
@@ -373,10 +373,10 @@ fn process_chain_alignment(
             Ok(recalign_output) => {
                 if !recalign_output.status.success() {
                     eprintln!(
-                        "Recalign failed for anchor pair ({} -> {}) with error {}, skipping.",
+                        "Recalign failed for anchor pair ({} -> {}) on read {}, skipping.",
                         String::from_utf8_lossy(&from.graph_pos.node_id),
                         String::from_utf8_lossy(&to.graph_pos.node_id),
-                        String::from_utf8_lossy(&recalign_output.stderr)
+                        String::from_utf8_lossy(read_id_b)
                     );
                     continue;
                 }

@@ -346,13 +346,13 @@ fn process_chain_alignment(
         gfa::writer::write_gfa(&subgraph, &mut gfa_out);
         gfa_out.insert_str(0, "GRAPH:\n");
         let read_out = format!("READ:\n>{}\n{}", String::from_utf8_lossy(read_id_b), read_slice);
-        eprintln!(
-            "SUBGRAPH (anchor {}->{}):\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
-            String::from_utf8_lossy(&from.graph_pos.node_id),
-            String::from_utf8_lossy(&to.graph_pos.node_id),
-            gfa_out, from.read_end, to.read_start,
-            String::from_utf8_lossy(read_id_b), read_slice
-        );
+        // eprintln!(
+        //     "SUBGRAPH (anchor {}->{}):\n{}\nREAD SLICE ({} to {}):\n>{}\n{}",
+        //     String::from_utf8_lossy(&from.graph_pos.node_id),
+        //     String::from_utf8_lossy(&to.graph_pos.node_id),
+        //     gfa_out, from.read_end, to.read_start,
+        //     String::from_utf8_lossy(read_id_b), read_slice
+        // );
 
         let recalign_t0 = std::time::Instant::now();
         let run_recalign = Command::new(RECALIGN_BIN)
@@ -454,6 +454,13 @@ fn process_chain_alignment(
                 });
             }
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    eprintln!(
+                        "Recalign timeout for read {}, skipping entire read alignment.",
+                        String::from_utf8_lossy(read_id_b)
+                    );
+                    return None;
+                }
                 eprintln!(
                     "Failed to execute recalign at '{}': {}. Build the submodule first.",
                     RECALIGN_BIN, e

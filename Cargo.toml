@@ -9,3 +9,4 @@ flate2 = "1"
 gfa = { git = "https://github.com/dcmonti/rs-gfa.git" }
 needletail = "0.6.1"
 rayon = "1.10"
+wait-timeout = "0.2"

@@ -207,11 +207,166 @@ fn process_one_chunk(
     eprintln!("Chunk {} flushed ({} chains).", chunk_no, chunk.len());
 }
 
+fn revcomp_bytes(seq: &[u8]) -> Vec<u8> {
+    seq.iter().rev().map(|&b| match b.to_ascii_uppercase() {
+        b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C', _ => b'N',
+    }).collect()
+}
+
+// Returns (match_bases, cigar) using approximate CIGAR when sequences are too long.
+fn approx_cigar(n: usize, m: usize) -> (usize, String) {
+    match n.cmp(&m) {
+        std::cmp::Ordering::Equal   => (n, format!("{}=", n)),
+        std::cmp::Ordering::Greater => (m, format!("{}={}I", m, n - m)),
+        std::cmp::Ordering::Less    => (n, format!("{}={}D", n, m - n)),
+    }
+}
+
+fn compute_nm_from_cigar(cigar: &str) -> usize {
+    let mut nm = 0usize;
+    let mut num = 0usize;
+    for ch in cigar.chars() {
+        if ch.is_ascii_digit() {
+            num = num * 10 + (ch as u8 - b'0') as usize;
+        } else {
+            if ch != '=' { nm += num; }
+            num = 0;
+        }
+    }
+    nm
+}
+
+/// Banded global pairwise alignment. Returns (match_count, cigar) with = X I D ops.
+/// For sequences longer than ALIGN_LEN_CAP falls back to approx_cigar.
+fn pairwise_align(query: &[u8], reference: &[u8]) -> (usize, String) {
+    let n = query.len();
+    let m = reference.len();
+    if n == 0 && m == 0 { return (0, String::new()); }
+    if n == 0 { return (0, format!("{}D", m)); }
+    if m == 0 { return (0, format!("{}I", n)); }
+
+    const ALIGN_LEN_CAP: usize = 4096;
+    if n > ALIGN_LEN_CAP || m > ALIGN_LEN_CAP {
+        return approx_cigar(n, m);
+    }
+
+    let len_diff = n.abs_diff(m);
+    // Band covers length difference + ~10% divergence; capped at min(n,m).
+    let band = (len_diff + n.max(m) / 10 + 16).min(n).min(m);
+    let w = 2 * band + 1; // fixed width per row in the flat arrays
+
+    // dp[i*w + (j - lo(i))] = edit distance for query[..i] vs reference[..j]
+    // lo(i) = i.saturating_sub(band), hi(i) = min(m, i+band)
+    // Uses u16: max edit distance ≤ ALIGN_LEN_CAP = 4096 < 65535.
+    const INF: u16 = u16::MAX;
+    let mut dp  = vec![INF; (n + 1) * w];
+    let mut dir = vec![0u8;  (n + 1) * w]; // 0=diag(=/X)  1=left(D)  2=above(I)
+
+    let lo = |i: usize| i.saturating_sub(band);
+    let hi = |i: usize| m.min(i + band);
+
+    // Row 0: all deletions
+    for j in 0..=hi(0) {
+        dp[j] = j as u16;
+        dir[j] = 1;
+    }
+    dir[0] = 0; // origin
+
+    // Column 0: all insertions (only rows where col 0 is in-band)
+    for i in 1..=n.min(band) {
+        dp[i * w] = i as u16;
+        dir[i * w] = 2;
+    }
+
+    for i in 1..=n {
+        let l_i    = lo(i);
+        let h_i    = hi(i);
+        let l_prev = lo(i - 1);
+        let h_prev = hi(i - 1);
+
+        for j in l_i..=h_i {
+            let idx = i * w + (j - l_i);
+
+            let diag = if j > 0 {
+                let jm1 = j - 1;
+                if jm1 >= l_prev && jm1 <= h_prev {
+                    let eq = query[i-1].to_ascii_uppercase() == reference[j-1].to_ascii_uppercase();
+                    dp[(i-1)*w + (jm1 - l_prev)].saturating_add(!eq as u16)
+                } else { INF }
+            } else { INF };
+
+            let above = if j >= l_prev && j <= h_prev {
+                dp[(i-1)*w + (j - l_prev)].saturating_add(1)
+            } else { INF };
+
+            let left = if j > l_i {
+                dp[i*w + (j - l_i - 1)].saturating_add(1)
+            } else { INF };
+
+            let best = diag.min(above).min(left);
+            dp[idx] = best;
+            dir[idx] = if best == diag { 0 } else if best == left { 1 } else { 2 };
+        }
+    }
+
+    // If (n, m) is outside the band or unreachable, fall back.
+    let final_lo = lo(n);
+    let final_hi = hi(n);
+    if m < final_lo || m > final_hi || dp[n * w + (m - final_lo)] == INF {
+        return approx_cigar(n, m);
+    }
+
+    // Traceback
+    let mut ops: Vec<u8> = Vec::with_capacity(n + m);
+    let (mut ci, mut cj) = (n, m);
+    let mut matches = 0usize;
+
+    while ci > 0 || cj > 0 {
+        match dir[ci * w + (cj - lo(ci))] {
+            0 => {
+                let eq = query[ci-1].to_ascii_uppercase() == reference[cj-1].to_ascii_uppercase();
+                ops.push(if eq { b'=' } else { b'X' });
+                if eq { matches += 1; }
+                ci -= 1; cj -= 1;
+            }
+            1 => { ops.push(b'D'); cj -= 1; }
+            _ => { ops.push(b'I'); ci -= 1; }
+        }
+    }
+
+    ops.reverse();
+
+    // Run-length encode CIGAR
+    let mut cigar = String::with_capacity(ops.len() * 2);
+    let mut cur_count = 0usize;
+    let mut cur_op = b' ';
+    for &op in &ops {
+        if op == cur_op {
+            cur_count += 1;
+        } else {
+            if cur_count > 0 {
+                use std::fmt::Write;
+                write!(cigar, "{}{}", cur_count, cur_op as char).unwrap();
+            }
+            cur_op = op;
+            cur_count = 1;
+        }
+    }
+    if cur_count > 0 {
+        use std::fmt::Write;
+        write!(cigar, "{}{}", cur_count, cur_op as char).unwrap();
+    }
+
+    (matches, cigar)
+}
+
 fn make_anchor_gaf(
     anchor: &rg_exp::chain::Anchor,
     read_id: &str,
     full_read_len: usize,
     path_offset: usize,
+    query_slice: &[u8],
+    ref_slice: &[u8],
 ) -> rg_exp::gaf::GAFStruct {
     let node_id_num = std::str::from_utf8(&anchor.graph_pos.node_id)
         .ok()
@@ -219,16 +374,22 @@ fn make_anchor_gaf(
         .unwrap_or(0);
     let q_span = anchor.read_end.saturating_sub(anchor.read_start);
     let r_span = anchor.graph_pos.position.1.saturating_sub(anchor.graph_pos.position.0);
-    let match_len = q_span.min(r_span);
-    // Build a CIGAR that is consistent with both query span and reference span.
-    // When they differ, the shorter side is fully matched and the excess is I or D.
-    let cigar = match q_span.cmp(&r_span) {
-        std::cmp::Ordering::Equal   => format!("{}=", match_len),
-        std::cmp::Ordering::Greater => format!("{}={}I", r_span, q_span - r_span),
-        std::cmp::Ordering::Less    => format!("{}={}D", q_span, r_span - q_span),
+
+    // Only run pairwise alignment when slice lengths exactly match the anchor spans.
+    // If coordinates are out of bounds the slices would be shorter than q_span/r_span,
+    // producing a CIGAR that doesn't cover the full anchor — fall back to approx in that case.
+    let (match_count, cigar) = if !query_slice.is_empty() && !ref_slice.is_empty()
+        && query_slice.len() == q_span && ref_slice.len() == r_span
+    {
+        pairwise_align(query_slice, ref_slice)
+    } else {
+        approx_cigar(q_span, r_span)
     };
+
+    let nm = compute_nm_from_cigar(&cigar);
     let alignment_block = q_span.max(r_span);
-    let comments = format!("tp:A:P\tNM:i:0\tdv:f:0.0000\tcg:Z:{}", cigar);
+    let dv = if alignment_block > 0 { nm as f64 / alignment_block as f64 } else { 0.0 };
+    let comments = format!("tp:A:P\tNM:i:{}\tdv:f:{:.4}\tcg:Z:{}", nm, dv, cigar);
     let path_dir = if anchor.graph_pos.orientation { '>' } else { '<' };
     rg_exp::gaf::GAFStruct::build_gaf_struct(
         read_id.to_string(),
@@ -241,7 +402,7 @@ fn make_anchor_gaf(
         path_offset + r_span,
         path_offset,
         path_offset + r_span,
-        match_len,
+        match_count,
         alignment_block.to_string(),
         "60".to_string(),
         comments,
@@ -294,9 +455,25 @@ fn process_chain_alignment(
     for i in 0..anchors.len() {
         let anchor = &anchors[i];
 
-        // Synthetic perfect-match GAF for this anchor (trusted by minigraph).
+        // Pairwise-align the anchor region (read slice vs. node slice).
         let anchor_ref_span = anchor.graph_pos.position.1.saturating_sub(anchor.graph_pos.position.0);
-        let anchor_gaf = make_anchor_gaf(anchor, &read_id_str, full_read_len, running_path_offset);
+        let (query_slice, ref_bytes) = {
+            let q = read_seq_opt.map(|s| {
+                let b = s.as_bytes();
+                let start = anchor.read_start.min(b.len());
+                let end   = anchor.read_end.min(b.len());
+                b[start..end].to_vec()
+            }).unwrap_or_default();
+            let r = index.get(&anchor.graph_pos.node_id).map(|ni| {
+                let seg = ni.segment.as_slice();
+                let p0 = anchor.graph_pos.position.0.min(seg.len());
+                let p1 = anchor.graph_pos.position.1.min(seg.len());
+                let raw = &seg[p0..p1];
+                if anchor.graph_pos.orientation { raw.to_vec() } else { revcomp_bytes(raw) }
+            }).unwrap_or_default();
+            (q, r)
+        };
+        let anchor_gaf = make_anchor_gaf(anchor, &read_id_str, full_read_len, running_path_offset, &query_slice, &ref_bytes);
         running_path_offset += anchor_ref_span;
         chain_gaf = Some(match chain_gaf.take() {
             Some(existing) => rg_exp::gaf::GAFStruct::merge_gafs(&existing, &anchor_gaf),
@@ -431,16 +608,21 @@ fn process_chain_alignment(
 
                 let mut gaf = get_gaf_from_recalign_output(&recalign_output.stdout, rc);
                 gaf.query_length = full_read_len;
-                gaf.query_start += from.read_end;
-                gaf.query_end += from.read_end;
 
                 // Replace recalign's local path coords with global running offset.
                 // gap_ref_span is path_end - path_start before any offset replacement,
                 // which equals reference_consumed by the CIGAR (consistent after RC too).
                 let gap_ref_span = gaf.path_end.saturating_sub(gaf.path_start);
+
+                // Force query span to cover exactly the read gap [from.read_end, to.read_start].
+                // recalign may return a partial alignment; reconcile_cigar_with_spans will
+                // pad or trim the CIGAR to make it consistent with these exact spans.
+                gaf.query_start = from.read_end;
+                gaf.query_end = to.read_start;
                 gaf.path_start = running_path_offset;
                 gaf.path_end = running_path_offset + gap_ref_span;
                 gaf.path_length = gaf.path_end;
+                gaf.reconcile_cigar_with_spans();
                 running_path_offset += gap_ref_span;
                 // The RC in get_gaf_from_recalign_output already mapped coordinates and
                 // reversed path/CIGAR into the original read's orientation. Force strand='+'
